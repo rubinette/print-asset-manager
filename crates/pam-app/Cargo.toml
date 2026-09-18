@@ -1,0 +1,19 @@
+[package]
+name = "pam-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "列印素材庫 — native GPUI desktop app"
+default-run = "print-asset-manager"
+
+[[bin]]
+name = "print-asset-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui-kit.workspace = true
+image.workspace = true
+pam-core.workspace = true
+pam-preview.workspace = true

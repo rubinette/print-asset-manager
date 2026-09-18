@@ -1,0 +1,23 @@
+[package]
+name = "pam-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Catalog, mesh loaders, and library scanning for 列印素材庫"
+
+[dependencies]
+directories.workspace = true
+image.workspace = true
+notify.workspace = true
+quick-xml = "0.37"
+rusqlite.workspace = true
+sha2.workspace = true
+stl_io.workspace = true
+thiserror.workspace = true
+tobj.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

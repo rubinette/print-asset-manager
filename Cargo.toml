@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/pam-core", "crates/pam-preview", "crates/pam-app"]
+default-members = ["crates/pam-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+pam-core = { path = "crates/pam-core" }
+pam-preview = { path = "crates/pam-preview" }
+anyhow = "1"
+directories = "6"
+gpui-kit = "0.6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+notify = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+stl_io = "0.11"
+thiserror = "2"
+tobj = "4"
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }

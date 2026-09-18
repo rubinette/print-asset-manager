@@ -1,0 +1,11 @@
+[package]
+name = "pam-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CPU mesh preview and thumbnail rendering"
+
+[dependencies]
+image.workspace = true
+pam-core.workspace = true
