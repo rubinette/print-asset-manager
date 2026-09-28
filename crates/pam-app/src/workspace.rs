@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::{DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, TitleBar,
+    h_flex, v_flex, ActiveTheme, Icon, IconName, Root, Selectable as _, Sizable as _, TitleBar,
+    WindowExt as _,
 };
 use gpui_kit::{prelude::FluentBuilder as _, Focusable as _, *};
 use pam_core::catalog::{Asset, AssetQuery, AssetSort, Catalog, Library, ThumbState};
@@ -416,21 +418,23 @@ impl Workspace {
         let Some(asset) = self.assets.iter().find(|a| a.id == id).cloned() else {
             return;
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &i18n::trash_confirm(asset.name()),
-            Some(i18n::t(Key::TrashDetail)),
-            &[
-                PromptButton::ok(i18n::t(Key::MoveToTrash)),
-                PromptButton::cancel(i18n::t(Key::Cancel)),
-            ],
+        let this = cx.entity().downgrade();
+        confirm_destructive(
+            window,
             cx,
+            i18n::trash_confirm(asset.name()),
+            i18n::t(Key::TrashDetail),
+            i18n::t(Key::MoveToTrash),
+            move |window, cx| {
+                let _ = this.update(cx, |this, cx| this.trash_asset(&asset, window, cx));
+            },
         );
+    }
+
+    fn trash_asset(&mut self, asset: &Asset, window: &mut Window, cx: &mut Context<Self>) {
+        let id = asset.id;
+        let path = asset.abs_path();
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let path = asset.abs_path();
             let result = cx
                 .background_spawn(async move { move_to_trash(&path) })
                 .await;
@@ -443,14 +447,13 @@ impl Workspace {
                     this.reload_after_removal(index, window, cx);
                 }
                 Err(err) => {
-                    // Info-only alert; dropping the answer receiver doesn't dismiss it.
-                    drop(window.prompt(
-                        PromptLevel::Critical,
-                        i18n::t(Key::TrashFailed),
-                        Some(&err.to_string()),
-                        &[PromptButton::ok(i18n::t(Key::Ok))],
-                        cx,
-                    ));
+                    let detail = err.to_string();
+                    window.open_alert_dialog(cx, move |alert, _, _| {
+                        alert
+                            .title(i18n::t(Key::TrashFailed))
+                            .description(detail.clone())
+                            .button_props(DialogButtonProps::default().ok_text(i18n::t(Key::Ok)))
+                    });
                 }
             })
             .ok();
@@ -463,24 +466,17 @@ impl Workspace {
         let Some(lib) = self.libraries.iter().find(|l| l.id == id).cloned() else {
             return;
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &i18n::remove_folder_confirm(library_label(&lib)),
-            Some(i18n::t(Key::RemoveFolderDetail)),
-            &[
-                PromptButton::ok(i18n::t(Key::RemoveFolder)),
-                PromptButton::cancel(i18n::t(Key::Cancel)),
-            ],
+        let this = cx.entity().downgrade();
+        confirm_destructive(
+            window,
             cx,
+            i18n::remove_folder_confirm(library_label(&lib)),
+            i18n::t(Key::RemoveFolderDetail),
+            i18n::t(Key::RemoveFolder),
+            move |window, cx| {
+                let _ = this.update(cx, |this, cx| this.remove_library(&lib, window, cx));
+            },
         );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            this.update_in(cx, |this, window, cx| this.remove_library(&lib, window, cx))
-                .ok();
-        })
-        .detach();
     }
 
     fn remove_library(&mut self, lib: &Library, window: &mut Window, cx: &mut Context<Self>) {
@@ -1002,6 +998,8 @@ impl Render for Workspace {
                     this.add_folder_path(path, cx);
                 }
             }))
+            // gpui-kit's Root doesn't paint dialogs itself; the root view must.
+            .children(Root::render_dialog_layer(window, cx))
     }
 }
 
@@ -1265,6 +1263,45 @@ fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 &theme,
             )
         }))
+}
+
+/// Confirm a destructive action. Cancel is the default: Enter and Escape
+/// both dismiss, and only clicking the danger button runs `on_confirm`.
+fn confirm_destructive(
+    window: &mut Window,
+    cx: &mut App,
+    title: String,
+    detail: &'static str,
+    confirm_label: &'static str,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let on_confirm = std::rc::Rc::new(on_confirm);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let on_confirm = on_confirm.clone();
+        alert
+            .title(title.clone())
+            .description(detail)
+            // The dialog maps Enter to OK; with this custom footer OK only closes.
+            .on_ok(|_, _, _| true)
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("confirm-cancel")
+                            .primary()
+                            .label(i18n::t(Key::Cancel))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("confirm-destructive")
+                            .danger()
+                            .label(confirm_label)
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                on_confirm(window, cx);
+                            }),
+                    ),
+            )
+    });
 }
 
 fn library_label(lib: &Library) -> &str {
@@ -2304,5 +2341,78 @@ mod theme_tests {
             assert_eq!(Theme::global(cx).mode, ThemeMode::from(window.appearance()));
         })
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::component::{Root, WindowExt as _};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{div, prelude::*, px, size, AppContext, Context, TestAppContext, Window};
+
+    struct Host;
+
+    impl gpui_kit::Render for Host {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            div()
+                .size_full()
+                .children(Root::render_dialog_layer(window, cx))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn destructive_confirm_defaults_to_cancel(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            Root::new(cx.new(|_| Host), window, cx)
+        });
+        let confirmed = Rc::new(Cell::new(0u32));
+        let open = |cx: &mut TestAppContext| {
+            let confirmed = confirmed.clone();
+            cx.update_window(handle.into(), |_, window, cx| {
+                super::confirm_destructive(
+                    window,
+                    cx,
+                    "Move?".into(),
+                    "detail",
+                    "Move to Trash",
+                    move |_, _| confirmed.set(confirmed.get() + 1),
+                );
+                window.render_frame(cx);
+                assert!(window.has_active_dialog(cx));
+            })
+            .unwrap();
+        };
+        let dialog_open = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.has_active_dialog(cx)
+            })
+            .unwrap()
+        };
+
+        for key in ["enter", "escape"] {
+            open(cx);
+            cx.simulate_keystrokes(handle.into(), key);
+            cx.run_until_parked();
+            assert!(!dialog_open(cx), "{key} should close the dialog");
+            assert_eq!(confirmed.get(), 0, "{key} must not confirm");
+        }
+
+        open(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("confirm-destructive", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!dialog_open(cx));
+        assert_eq!(confirmed.get(), 1);
     }
 }

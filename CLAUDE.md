@@ -26,7 +26,7 @@ Three crates, layered strictly `pam-app → pam-preview → pam-core`:
 
 - **`pam-core`** — no UI. `Catalog` wraps a single `rusqlite::Connection` behind a `Mutex` (shared as `Arc<Catalog>` across threads). Schema lives in the `SCHEMA` const in `catalog.rs` and is applied with `CREATE ... IF NOT EXISTS` on every open — there is no migration system, so schema changes to existing tables need care. `load.rs` parses STL/OBJ/3MF into a triangle-soup `Mesh`; `extract_3mf_thumbnail` pulls slicer-embedded PNGs (e.g. `Metadata/plate_1.png`). `watch.rs` runs a `notify` watcher on its own thread with a command channel; `affected_library` maps an event path to the library with the longest matching root. `paths.rs` owns all on-disk locations (via `directories::ProjectDirs`).
 - **`pam-preview`** — pure CPU software rasterizer (no GPU). `render_thumbnail` / `render_mesh` with an orbit `Camera`, output `image::RgbaImage`, `encode_png`.
-- **`pam-app`** — GPUI UI. `main.rs` sets up actions, keybindings, menus, window. `workspace.rs` is the single root view holding all UI state; `jobs.rs` is the thumbnail pipeline; `i18n.rs` holds all strings.
+- **`pam-app`** — GPUI UI. `main.rs` sets up actions, keybindings, menus, window. `workspace.rs` is the single root view holding all UI state; `jobs.rs` is the thumbnail pipeline; `i18n.rs` holds all strings. Destructive actions go through `confirm_destructive` (in-app gpui-kit dialog where Enter and Escape both cancel), not native `window.prompt`, whose NSAlert makes the first button the Return default; dialogs only paint because `Workspace::render` includes `Root::render_dialog_layer`.
 
 ### Data flow
 

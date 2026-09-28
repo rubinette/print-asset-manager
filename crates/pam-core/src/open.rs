@@ -43,6 +43,7 @@ pub fn move_to_trash(path: &Path) -> Result<()> {
     {
         use trash::macos::{DeleteMethod, TrashContextExtMacos};
         // The default Finder method needs Automation permission to script Finder.
+        // NSFileManager loses Trash "Put Back", which is fine: not needed.
         ctx.set_delete_method(DeleteMethod::NsFileManager);
     }
     ctx.delete(path)
