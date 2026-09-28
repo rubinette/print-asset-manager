@@ -1,7 +1,6 @@
 use image::RgbaImage;
 use pam_core::Mesh;
 
-const MAX_PREVIEW_TRIS: usize = 500_000;
 const BG: [u8; 4] = [18, 18, 22, 255];
 const DIFFUSE: [f32; 3] = [0.55, 0.72, 0.88];
 
@@ -48,11 +47,13 @@ pub fn render_mesh(
     height: u32,
     background: [u8; 4],
 ) -> RgbaImage {
-    let mesh = mesh.simplified(MAX_PREVIEW_TRIS);
+    // Renders every triangle; callers pass a `Mesh::simplified` LOD when they
+    // need speed (e.g. while dragging). ~100 ms for 3M triangles at 480 px.
     let w = width.max(1) as i32;
     let h = height.max(1) as i32;
     let mut color = vec![background; (w * h) as usize];
-    let mut zbuf = vec![f32::INFINITY; (w * h) as usize];
+    // 1/depth per pixel; 0 = nothing drawn yet, larger = nearer.
+    let mut zbuf = vec![0.0f32; (w * h) as usize];
 
     if mesh.is_empty() || !mesh.bbox.is_valid() {
         return to_image(width, height, &color);
@@ -62,20 +63,34 @@ pub fn render_mesh(
     let radius = mesh.bbox.diagonal().max(1e-3) * 0.5;
     let (view, light) = view_matrix(camera, center, radius);
     let aspect = width as f32 / height.max(1) as f32;
-    let proj = perspective(40f32.to_radians(), aspect, 0.05, 100.0);
+    let focal = 1.0 / (40f32.to_radians() * 0.5).tan();
+    // Scaled to the model so zooming into it clips cleanly instead of
+    // projecting geometry that is behind the camera.
+    let near = radius * 1e-3;
 
-    let verts: Vec<[f32; 3]> = mesh
+    // View space with depth positive in front of the camera.
+    let view_verts: Vec<[f32; 3]> = mesh
         .vertices
         .iter()
-        .map(|v| project(proj, view, *v))
+        .map(|v| {
+            let p = mul(view, *v);
+            [p[0], p[1], -p[2]]
+        })
         .collect();
+    // Screen x/y plus 1/depth, which interpolates linearly in screen space
+    // and keeps relative precision (NDC z crowds everything next to 1.0, so
+    // thin walls z-fought and back faces bled through).
+    let to_screen = |p: [f32; 3]| {
+        let inv = 1.0 / p[2];
+        [
+            (p[0] * focal / aspect * inv * 0.5 + 0.5) * (w as f32 - 1.0),
+            (1.0 - (p[1] * focal * inv * 0.5 + 0.5)) * (h as f32 - 1.0),
+            inv,
+        ]
+    };
 
-    let n_tris = mesh.triangle_count();
-    for t in 0..n_tris {
-        let i0 = mesh.indices[t * 3] as usize;
-        let i1 = mesh.indices[t * 3 + 1] as usize;
-        let i2 = mesh.indices[t * 3 + 2] as usize;
-        let (a, b, c) = (verts[i0], verts[i1], verts[i2]);
+    for tri in mesh.indices.chunks_exact(3) {
+        let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         let (wa, wb, wc) = (mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]);
         let e1 = sub(wb, wa);
         let e2 = sub(wc, wa);
@@ -87,16 +102,19 @@ pub fn render_mesh(
             (DIFFUSE[2] * ndotl * 255.0) as u8,
             255,
         ];
-        fill_triangle(
-            &mut color,
-            &mut zbuf,
-            w,
-            h,
-            ndc_to_px(a, w, h),
-            ndc_to_px(b, w, h),
-            ndc_to_px(c, w, h),
-            shade,
-        );
+        let (poly, count) = clip_near([view_verts[i0], view_verts[i1], view_verts[i2]], near);
+        for k in 1..count.saturating_sub(1) {
+            fill_triangle(
+                &mut color,
+                &mut zbuf,
+                w,
+                h,
+                to_screen(poly[0]),
+                to_screen(poly[k]),
+                to_screen(poly[k + 1]),
+                shade,
+            );
+        }
     }
 
     to_image(width, height, &color)
@@ -142,16 +160,6 @@ fn view_matrix(camera: &Camera, center: [f32; 3], radius: f32) -> ([[f32; 4]; 4]
     (m, light)
 }
 
-fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fovy * 0.5).tan();
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) / (near - far), -1.0],
-        [0.0, 0.0, (2.0 * far * near) / (near - far), 0.0],
-    ]
-}
-
 fn mul(m: [[f32; 4]; 4], v: [f32; 3]) -> [f32; 4] {
     mul4(m, [v[0], v[1], v[2], 1.0])
 }
@@ -165,20 +173,28 @@ fn mul4(m: [[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-fn project(proj: [[f32; 4]; 4], view: [[f32; 4]; 4], v: [f32; 3]) -> [f32; 3] {
-    let clip = mul4(proj, mul(view, v));
-    let w = if clip[3].abs() < 1e-8 { 1e-8 } else { clip[3] };
-    [clip[0] / w, clip[1] / w, clip[2] / w]
+/// Clip a view-space triangle to `depth >= near`. Yields 0, 3 or 4 vertices
+/// (a quad when one corner was cut off), to be drawn as a fan.
+fn clip_near(tri: [[f32; 3]; 3], near: f32) -> ([[f32; 3]; 4], usize) {
+    let mut out = [[0.0; 3]; 4];
+    let mut n = 0;
+    for i in 0..3 {
+        let (a, b) = (tri[i], tri[(i + 1) % 3]);
+        let (a_in, b_in) = (a[2] >= near, b[2] >= near);
+        if a_in {
+            out[n] = a;
+            n += 1;
+        }
+        if a_in != b_in {
+            let t = (near - a[2]) / (b[2] - a[2]);
+            out[n] = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, near];
+            n += 1;
+        }
+    }
+    (out, n)
 }
 
-fn ndc_to_px(p: [f32; 3], w: i32, h: i32) -> [f32; 3] {
-    [
-        (p[0] * 0.5 + 0.5) * (w as f32 - 1.0),
-        (1.0 - (p[1] * 0.5 + 0.5)) * (h as f32 - 1.0),
-        p[2],
-    ]
-}
-
+#[allow(clippy::too_many_arguments)]
 fn fill_triangle(
     color: &mut [[u8; 4]],
     zbuf: &mut [f32],
@@ -210,10 +226,10 @@ fn fill_triangle(
             if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                 continue;
             }
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+            let inv_depth = w0 * a[2] + w1 * b[2] + w2 * c[2];
             let idx = (y * w + x) as usize;
-            if z < zbuf[idx] {
-                zbuf[idx] = z;
+            if inv_depth > zbuf[idx] {
+                zbuf[idx] = inv_depth;
                 color[idx] = shade;
             }
         }
@@ -331,5 +347,46 @@ mod tests {
             painted > 40,
             "expected visible cube after orbit, got {painted}"
         );
+    }
+
+    #[test]
+    fn clip_near_keeps_splits_or_drops() {
+        let near = 1.0;
+        let tri = |d: [f32; 3]| [[0., 0., d[0]], [1., 0., d[1]], [0., 1., d[2]]];
+        // Entirely in front: unchanged.
+        assert_eq!(clip_near(tri([2., 3., 4.]), near).1, 3);
+        // Entirely behind the near plane (or the eye): nothing to draw.
+        assert_eq!(clip_near(tri([0.5, -1., -2.]), near).1, 0);
+        // One corner behind: a quad, all of it on or in front of the plane.
+        let (quad, n) = clip_near(tri([-1., 3., 3.]), near);
+        assert_eq!(n, 4);
+        assert!(quad.iter().all(|v| v[2] >= near));
+        // Two corners behind: a smaller triangle.
+        let (small, n) = clip_near(tri([3., -1., -1.]), near);
+        assert_eq!(n, 3);
+        assert!(small[..3].iter().all(|v| v[2] >= near));
+    }
+
+    #[test]
+    fn thin_plate_back_face_does_not_bleed_through() {
+        // 2 m plate, 0.1 mm thick, seen from above: only the top face's shade
+        // may appear, never the bottom face z-fighting through it.
+        let (s, t) = (2000.0, 0.1);
+        let plate = Mesh::from_triangles(&[
+            [[0., t, 0.], [0., t, s], [s, t, s]],
+            [[0., t, 0.], [s, t, s], [s, t, 0.]],
+            [[0., 0., 0.], [s, 0., s], [0., 0., s]],
+            [[0., 0., 0.], [s, 0., 0.], [s, 0., s]],
+        ]);
+        let img = render_mesh(&plate, &Camera::default(), 128, 128, BG);
+        // The plate has no side walls, so a sliver of the bottom face is
+        // legitimately visible past the front edge; judge the interior only.
+        let shades: std::collections::HashSet<[u8; 4]> = img
+            .enumerate_pixels()
+            .filter(|(x, y, _)| (40..88).contains(x) && (40..88).contains(y))
+            .map(|(_, _, p)| p.0)
+            .filter(|p| *p != BG)
+            .collect();
+        assert_eq!(shades.len(), 1, "saw {} shades: {shades:?}", shades.len());
     }
 }

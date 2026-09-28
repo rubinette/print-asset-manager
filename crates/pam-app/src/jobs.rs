@@ -9,6 +9,10 @@ use pam_preview::{encode_png, render_thumbnail};
 pub const THUMB_CONCURRENCY: usize = 2;
 const THUMB_BATCH: usize = THUMB_CONCURRENCY * 8;
 const THUMB_SIZE: u32 = 256;
+/// Bump when rendered thumbnails would come out differently (renderer or
+/// loader changes); the app then redraws them once at startup.
+/// 2: full-mesh render, near-plane clipping, 3MF modifiers hidden.
+pub const THUMB_RENDER_VERSION: &str = "2";
 
 pub fn process_thumb(catalog: &Catalog, asset: &Asset) {
     // Library went offline mid-batch: leave it pending rather than `failed`,

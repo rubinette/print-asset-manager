@@ -131,31 +131,117 @@ impl Mesh {
         self.indices.len() < 3
     }
 
-    /// Keep at most `max_tris` triangles by uniform stride. Used for preview.
-    /// Borrows `self` when it is already within budget.
+    /// At most `max_tris` triangles, for interactive preview. Borrows `self`
+    /// when it is already within budget.
+    ///
+    /// Uses vertex clustering: weld vertices on a uniform grid and drop the
+    /// triangles that collapse. The surface stays closed, just coarser.
+    /// (Keeping every Nth triangle instead leaves see-through confetti of
+    /// stray slivers.)
     pub fn simplified(&self, max_tris: usize) -> Cow<'_, Mesh> {
         let n = self.triangle_count();
         if n <= max_tris {
             return Cow::Borrowed(self);
         }
-        let stride = ((n as f32 / max_tris as f32).ceil() as usize).max(1);
+        if max_tris == 0 || !self.bbox.is_valid() {
+            return Cow::Owned(self.strided(max_tris));
+        }
+        // Surviving triangles scale with the surface cells, i.e. ~res².
+        // Guess from the budget, then correct from what the guess produced.
+        let mut res = (max_tris as f32 / 2.0).sqrt().clamp(2.0, 1_000_000.0);
+        let mut best: Option<Mesh> = None;
+        for _ in 0..4 {
+            let mesh = self.clustered(res as u32);
+            let got = mesh.triangle_count();
+            let fits = got <= max_tris && got > 0;
+            if fits && best.as_ref().is_none_or(|b| got > b.triangle_count()) {
+                // Close enough to the budget; another pass costs a full sweep.
+                if got * 10 >= max_tris * 6 {
+                    return Cow::Owned(mesh);
+                }
+                best = Some(mesh);
+            }
+            let scale = if got == 0 {
+                2.0
+            } else {
+                (max_tris as f32 / got as f32).sqrt() * 0.95
+            };
+            res = (res * scale).clamp(2.0, 1_000_000.0);
+        }
+        Cow::Owned(best.unwrap_or_else(|| self.strided(max_tris)))
+    }
+
+    /// Weld vertices into a `res`-cells-per-longest-side grid (cluster
+    /// position = member average) and keep only non-degenerate triangles.
+    fn clustered(&self, res: u32) -> Mesh {
+        let size = self.bbox.size();
+        let longest = size[0].max(size[1]).max(size[2]).max(f32::MIN_POSITIVE);
+        let inv_cell = res.max(1) as f32 / longest;
+        let dims = res.max(1) as u64 + 1;
+        let mut cluster_of = Vec::with_capacity(self.vertices.len());
+        let mut ids: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut sums: Vec<[f64; 3]> = Vec::new();
+        let mut counts: Vec<u32> = Vec::new();
+        for v in &self.vertices {
+            let cell = |i: usize| (((v[i] - self.bbox.min[i]) * inv_cell) as u64).min(dims - 1);
+            let key = cell(0) + dims * (cell(1) + dims * cell(2));
+            let id = *ids.entry(key).or_insert_with(|| {
+                sums.push([0.0; 3]);
+                counts.push(0);
+                (sums.len() - 1) as u32
+            });
+            let sum = &mut sums[id as usize];
+            for i in 0..3 {
+                sum[i] += v[i] as f64;
+            }
+            counts[id as usize] += 1;
+            cluster_of.push(id);
+        }
+        let mut bbox = BBox::empty();
+        let vertices: Vec<[f32; 3]> = sums
+            .iter()
+            .zip(&counts)
+            .map(|(s, &c)| {
+                let c = c as f64;
+                let v = [(s[0] / c) as f32, (s[1] / c) as f32, (s[2] / c) as f32];
+                bbox.include(v);
+                v
+            })
+            .collect();
+        let mut indices = Vec::new();
+        for tri in self.indices.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| cluster_of[tri[k] as usize]);
+            if a != b && b != c && a != c {
+                indices.extend_from_slice(&[a, b, c]);
+            }
+        }
+        Mesh {
+            vertices,
+            indices,
+            bbox,
+        }
+    }
+
+    /// Every Nth triangle. Only a fallback: it leaves holes.
+    fn strided(&self, max_tris: usize) -> Mesh {
+        let n = self.triangle_count();
+        let stride = n.div_ceil(max_tris.max(1)).max(1);
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         let mut bbox = BBox::empty();
-        for t in (0..n).step_by(stride) {
+        for t in (0..n).step_by(stride).take(max_tris) {
             for k in 0..3 {
-                let src = self.indices[t * 3 + k] as usize;
-                let v = self.vertices[src];
+                let v = self.vertices[self.indices[t * 3 + k] as usize];
                 indices.push(vertices.len() as u32);
                 bbox.include(v);
                 vertices.push(v);
             }
         }
-        Cow::Owned(Self {
+        Mesh {
             vertices,
             indices,
             bbox,
-        })
+        }
     }
 }
 
@@ -216,5 +302,54 @@ mod tests {
         assert!(slim.triangle_count() <= 4);
         assert!(slim.triangle_count() >= 1);
         assert!(Mesh::from_triangles(&[]).is_empty());
+    }
+
+    /// A finely tessellated closed box (triangle soup, like a binary STL).
+    fn dense_box(steps: usize) -> Mesh {
+        let mut tris = Vec::new();
+        let d = 10.0 / steps as f32;
+        for axis in 0..3 {
+            for side in [0.0f32, 10.0] {
+                for i in 0..steps {
+                    for j in 0..steps {
+                        let p = |u: usize, v: usize| {
+                            let mut q = [0.0; 3];
+                            q[axis] = side;
+                            q[(axis + 1) % 3] = u as f32 * d;
+                            q[(axis + 2) % 3] = v as f32 * d;
+                            q
+                        };
+                        tris.push([p(i, j), p(i + 1, j), p(i + 1, j + 1)]);
+                        tris.push([p(i, j), p(i + 1, j + 1), p(i, j + 1)]);
+                    }
+                }
+            }
+        }
+        Mesh::from_triangles(&tris)
+    }
+
+    #[test]
+    fn simplify_clusters_instead_of_dropping_triangles() {
+        let mesh = dense_box(100); // 120k triangles
+        let slim = mesh.simplified(5_000);
+        let n = slim.triangle_count();
+        assert!((2_000..=5_000).contains(&n), "got {n}");
+        // Same extent: clustering moves vertices, it doesn't carve pieces out.
+        for i in 0..3 {
+            assert!(
+                slim.bbox.min[i] < 0.5 && slim.bbox.max[i] > 9.5,
+                "{:?}",
+                slim.bbox
+            );
+        }
+        // Closed surface in, closed surface out: every edge still has a twin.
+        let mut edges = std::collections::HashMap::<(u32, u32), i32>::new();
+        for t in slim.indices.chunks_exact(3) {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let open = edges.values().filter(|&&c| c % 2 == 1).count();
+        assert_eq!(open, 0, "simplified box has {open} boundary edges (holes)");
     }
 }

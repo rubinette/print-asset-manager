@@ -185,6 +185,11 @@ struct Object {
     vertices: Vec<[f32; 3]>,
     indices: Vec<u32>,
     components: Vec<Component>,
+    /// 3MF `type` of `other` (how Bambu/Orca store modifiers, negative parts
+    /// and support blockers/enforcers) or `support` / `solidsupport`. None of
+    /// it is the printed shape, so the preview leaves it out. `model` (the
+    /// default) and `surface` are drawn.
+    auxiliary: bool,
 }
 
 #[derive(Default)]
@@ -294,13 +299,27 @@ impl<R: Read + std::io::Seek> Package<R> {
         } else {
             root_part.build.clone()
         };
+        let mesh = self.emit_items(root, &items, false)?;
+        if !mesh.is_empty() {
+            return Ok(mesh);
+        }
+        // Nothing but auxiliary objects: show them rather than nothing.
+        self.emit_items(root, &items, true)
+    }
+
+    fn emit_items(
+        &mut self,
+        root: &str,
+        items: &[(u32, Transform)],
+        include_auxiliary: bool,
+    ) -> std::result::Result<Mesh, String> {
         let mut mesh = Mesh {
             vertices: Vec::new(),
             indices: Vec::new(),
             bbox: crate::mesh::BBox::empty(),
         };
         for (id, transform) in items {
-            self.emit(root, id, &transform, &mut mesh, 0)?;
+            self.emit(root, *id, transform, &mut mesh, include_auxiliary, 0)?;
         }
         Ok(mesh)
     }
@@ -311,6 +330,7 @@ impl<R: Read + std::io::Seek> Package<R> {
         id: u32,
         transform: &Transform,
         out: &mut Mesh,
+        include_auxiliary: bool,
         depth: u32,
     ) -> std::result::Result<(), String> {
         if depth > MAX_COMPONENT_DEPTH {
@@ -320,6 +340,9 @@ impl<R: Read + std::io::Seek> Package<R> {
         let Some(obj) = self.parts[part].objects.get(&id) else {
             return Ok(());
         };
+        if obj.auxiliary && !include_auxiliary {
+            return Ok(());
+        }
         let base = out.vertices.len() as u32;
         let n = obj.vertices.len() as u32;
         for &v in &obj.vertices {
@@ -336,7 +359,14 @@ impl<R: Read + std::io::Seek> Package<R> {
         for c in components {
             let child_part = c.path.as_deref().unwrap_or(part).to_string();
             let t = compose(&c.transform, transform);
-            self.emit(&child_part, c.object_id, &t, out, depth + 1)?;
+            self.emit(
+                &child_part,
+                c.object_id,
+                &t,
+                out,
+                include_auxiliary,
+                depth + 1,
+            )?;
         }
         Ok(())
     }
@@ -385,10 +415,16 @@ fn parse_model_part(src: impl std::io::BufRead) -> std::result::Result<ModelPart
         match e.local_name().as_ref() {
             b"object" => {
                 let id = attr_parse(e, b"id").unwrap_or(0);
+                let object = Object {
+                    auxiliary: attr_str(e, b"type").is_some_and(|t| {
+                        matches!(t.as_str(), "other" | "support" | "solidsupport")
+                    }),
+                    ..Default::default()
+                };
                 if is_empty {
-                    part.objects.insert(id, Object::default());
+                    part.objects.insert(id, object);
                 } else {
-                    current = Some((id, Object::default()));
+                    current = Some((id, object));
                 }
             }
             b"vertex" => {
@@ -796,6 +832,64 @@ endsolid cube
         assert_eq!(mesh.triangle_count(), 2);
         assert_eq!(mesh.bbox.min, [0.0, 0.0, 5.0]);
         assert_eq!(mesh.bbox.max, [11.0, 2.0, 5.0]);
+    }
+
+    fn write_single_part_3mf(dest: &Path, model: &str) {
+        let mut zip = zip::ZipWriter::new(File::create(dest).unwrap());
+        zip.start_file("3D/3dmodel.model", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(model.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn tri_object(id: u32, ty: &str, z: f32) -> String {
+        format!(
+            r#"<object id="{id}" type="{ty}"><mesh><vertices>
+<vertex x="0" y="0" z="{z}"/><vertex x="1" y="0" z="{z}"/><vertex x="0" y="1" z="{z}"/>
+</vertices><triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>"#
+        )
+    }
+
+    /// Bambu stores modifiers / negative parts as `type="other"` components
+    /// of the printed object; they must not show up as extra geometry.
+    #[test]
+    fn threemf_skips_modifier_and_negative_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("modifier.3mf");
+        let model = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+ <resources>{}{}{}
+  <object id="4" type="model"><components>
+   <component objectid="1"/><component objectid="2"/><component objectid="3"/>
+  </components></object>
+ </resources>
+ <build><item objectid="4"/></build>
+</model>"#,
+            tri_object(1, "model", 0.0),
+            tri_object(2, "other", 50.0),
+            tri_object(3, "solidsupport", 80.0),
+        );
+        write_single_part_3mf(&path, &model);
+        let mesh = load_mesh(&path).unwrap();
+        assert_eq!(mesh.triangle_count(), 1);
+        assert_eq!(mesh.bbox.max[2], 0.0);
+    }
+
+    #[test]
+    fn threemf_with_only_auxiliary_objects_still_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("only-other.3mf");
+        let model = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+ <resources>{}</resources>
+ <build><item objectid="1"/></build>
+</model>"#,
+            tri_object(1, "other", 0.0),
+        );
+        write_single_part_3mf(&path, &model);
+        assert_eq!(load_mesh(&path).unwrap().triangle_count(), 1);
     }
 
     #[test]

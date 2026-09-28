@@ -55,6 +55,9 @@ const THUMB_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Triangle budget while the user is dragging the preview.
 const DRAG_PREVIEW_TRIS: usize = 60_000;
+/// Triangle budget for the still preview. Past this a 640 px frame shows no
+/// more detail, while a 48M-triangle scan took 2 s per frame.
+const STILL_PREVIEW_TRIS: usize = 2_000_000;
 
 /// Parsed mesh for the selected asset, kept so orbit/zoom don't reparse the file.
 struct PreviewMesh {
@@ -66,7 +69,12 @@ struct PreviewMesh {
 
 impl PreviewMesh {
     fn new(asset: &Asset, mesh: Mesh) -> Self {
-        let full = Arc::new(mesh);
+        // Owned result drops the original, which for huge scans is most of
+        // the memory held while the preview is open.
+        let full = Arc::new(match mesh.simplified(STILL_PREVIEW_TRIS) {
+            std::borrow::Cow::Borrowed(_) => mesh,
+            std::borrow::Cow::Owned(m) => m,
+        });
         let lod = match full.simplified(DRAG_PREVIEW_TRIS) {
             std::borrow::Cow::Borrowed(_) => full.clone(),
             std::borrow::Cow::Owned(m) => Arc::new(m),
@@ -206,6 +214,13 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let catalog =
             Arc::new(Catalog::open(&pam_core::paths::catalog_db_path()).expect("open catalog"));
+        // Redraw app-rendered thumbnails once after the renderer changed; the
+        // startup scan below then kicks the thumbnail queue.
+        if read_pref("thumb_version").as_deref().map(str::trim) != Some(jobs::THUMB_RENDER_VERSION)
+            && catalog.requeue_rendered_thumbs().is_ok()
+        {
+            write_pref("thumb_version", jobs::THUMB_RENDER_VERSION);
+        }
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::Search)));
         let tag_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::TagsHint)));

@@ -573,6 +573,19 @@ impl Catalog {
         Ok(n as u32)
     }
 
+    /// Queue every app-rendered (`ready`) thumbnail again and retry `failed`
+    /// ones, e.g. after the renderer or loader changed. Slicer-embedded
+    /// thumbnails are left alone. Returns how many were requeued.
+    pub fn requeue_rendered_thumbs(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE assets SET thumb_state='pending', error=NULL
+             WHERE thumb_state IN ('ready', 'failed')",
+            [],
+        )?;
+        Ok(n as u32)
+    }
+
     /// Reset `ready` / `embedded` assets to `pending` when `thumb_exists` says
     /// their cached PNG is gone (the OS or the user may clear the cache dir).
     /// Returns how many were requeued.
@@ -1097,6 +1110,37 @@ mod tests {
         assert_eq!(updated.bbox.unwrap().format_mm(), "10×20×30 mm");
         assert_eq!(updated.sha256_hex().unwrap().len(), 64);
         assert_eq!(cat.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn requeue_rendered_thumbs_keeps_embedded() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["r.stl", "e.3mf", "f.stl"] {
+            fs::write(dir.path().join(name), name).unwrap();
+        }
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let state_of = |n: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|a| a.rel_path == n)
+                .unwrap()
+        };
+        cat.set_thumb_state(state_of("r.stl").id, ThumbState::Ready, None)
+            .unwrap();
+        cat.set_thumb_state(state_of("e.3mf").id, ThumbState::Embedded, None)
+            .unwrap();
+        cat.set_thumb_state(state_of("f.stl").id, ThumbState::Failed, Some("x"))
+            .unwrap();
+
+        assert_eq!(cat.requeue_rendered_thumbs().unwrap(), 2);
+        assert_eq!(state_of("r.stl").thumb_state, ThumbState::Pending);
+        let failed = state_of("f.stl");
+        assert_eq!(failed.thumb_state, ThumbState::Pending);
+        assert!(failed.error.is_none());
+        assert_eq!(state_of("e.3mf").thumb_state, ThumbState::Embedded);
     }
 
     #[test]
