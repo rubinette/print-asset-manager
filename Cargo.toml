@@ -20,7 +20,10 @@ notify = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 stl_io = "0.11"
+sys-locale = "0.3"
+tempfile = "3"
 thiserror = "2"
 tobj = "4"
+trash = "5"
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }

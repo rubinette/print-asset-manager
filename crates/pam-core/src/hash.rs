@@ -28,3 +28,25 @@ pub fn file_sha256(path: &Path) -> Result<[u8; 32]> {
 pub fn file_sha256_hex(path: &Path) -> Result<String> {
     Ok(hex_sha256(&file_sha256(path)?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_file_has_known_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(
+            file_sha256_hex(&path).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(file_sha256(&dir.path().join("nope")).is_err());
+    }
+}

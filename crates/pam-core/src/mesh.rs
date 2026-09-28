@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,10 +132,11 @@ impl Mesh {
     }
 
     /// Keep at most `max_tris` triangles by uniform stride. Used for preview.
-    pub fn simplified(&self, max_tris: usize) -> Mesh {
+    /// Borrows `self` when it is already within budget.
+    pub fn simplified(&self, max_tris: usize) -> Cow<'_, Mesh> {
         let n = self.triangle_count();
         if n <= max_tris {
-            return self.clone();
+            return Cow::Borrowed(self);
         }
         let stride = ((n as f32 / max_tris as f32).ceil() as usize).max(1);
         let mut vertices = Vec::new();
@@ -149,10 +151,70 @@ impl Mesh {
                 vertices.push(v);
             }
         }
-        Self {
+        Cow::Owned(Self {
             vertices,
             indices,
             bbox,
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn format_from_path_and_label() {
+        assert_eq!(
+            AssetFormat::from_path(Path::new("a.STL")),
+            Some(AssetFormat::Stl)
+        );
+        assert_eq!(
+            AssetFormat::from_path(Path::new("a.obj")),
+            Some(AssetFormat::Obj)
+        );
+        assert_eq!(
+            AssetFormat::from_path(Path::new("a.3MF")),
+            Some(AssetFormat::ThreeMf)
+        );
+        assert_eq!(AssetFormat::from_path(Path::new("a.txt")), None);
+        assert_eq!(AssetFormat::from_str("threemf"), Some(AssetFormat::ThreeMf));
+        assert_eq!(AssetFormat::from_str("nope"), None);
+        assert_eq!(AssetFormat::Stl.as_str(), "stl");
+        assert_eq!(AssetFormat::Obj.label(), "OBJ");
+        assert_eq!(AssetFormat::ThreeMf.label(), "3MF");
+    }
+
+    #[test]
+    fn bbox_grows_and_reports_size() {
+        let mut bbox = BBox::empty();
+        assert!(!bbox.is_valid());
+        bbox.include([1.0, 2.0, 3.0]);
+        bbox.include([-1.0, 4.0, 0.0]);
+        assert!(bbox.is_valid());
+        assert_eq!(bbox.size(), [2.0, 2.0, 3.0]);
+        assert_eq!(bbox.center(), [0.0, 3.0, 1.5]);
+        assert!((bbox.diagonal() - (4.0 + 4.0 + 9.0f32).sqrt()).abs() < 1e-5);
+        assert_eq!(bbox.format_mm(), "2×2×3 mm");
+    }
+
+    #[test]
+    fn mesh_simplify_keeps_at_most_max_tris() {
+        let tris: Vec<[[f32; 3]; 3]> = (0..12)
+            .map(|i| {
+                let z = i as f32;
+                [[0., 0., z], [1., 0., z], [0., 1., z]]
+            })
+            .collect();
+        let mesh = Mesh::from_triangles(&tris);
+        assert_eq!(mesh.triangle_count(), 12);
+        assert!(!mesh.is_empty());
+        assert_eq!(mesh.simplified(12).triangle_count(), 12);
+        assert!(matches!(mesh.simplified(12), Cow::Borrowed(_)));
+        let slim = mesh.simplified(4);
+        assert!(slim.triangle_count() <= 4);
+        assert!(slim.triangle_count() >= 1);
+        assert!(Mesh::from_triangles(&[]).is_empty());
     }
 }

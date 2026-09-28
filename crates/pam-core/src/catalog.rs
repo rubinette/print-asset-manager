@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,9 +10,13 @@ use crate::error::Result;
 use crate::hash::file_sha256;
 use crate::mesh::{AssetFormat, BBox};
 
+/// Files written per scan transaction.
+const SCAN_CHUNK: usize = 500;
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 
 CREATE TABLE IF NOT EXISTS libraries (
   id INTEGER PRIMARY KEY,
@@ -46,6 +50,9 @@ CREATE TABLE IF NOT EXISTS asset_tags (
   tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
   PRIMARY KEY (asset_id, tag_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_assets_thumb_state ON assets(thumb_state);
+CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
   name, rel_path, tags, content='', contentless_delete=1
@@ -122,13 +129,127 @@ impl Asset {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AssetSort {
+    #[default]
+    NameAsc,
+    NameDesc,
+    ModifiedDesc,
+    ModifiedAsc,
+    SizeDesc,
+    SizeAsc,
+    TrianglesDesc,
+    TrianglesAsc,
+    Format,
+}
+
+impl AssetSort {
+    pub const ALL: [Self; 9] = [
+        Self::NameAsc,
+        Self::NameDesc,
+        Self::ModifiedDesc,
+        Self::ModifiedAsc,
+        Self::SizeDesc,
+        Self::SizeAsc,
+        Self::TrianglesDesc,
+        Self::TrianglesAsc,
+        Self::Format,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NameAsc => "name",
+            Self::NameDesc => "name-desc",
+            Self::ModifiedDesc => "modified",
+            Self::ModifiedAsc => "modified-asc",
+            Self::SizeDesc => "size",
+            Self::SizeAsc => "size-asc",
+            Self::TrianglesDesc => "triangles",
+            Self::TrianglesAsc => "triangles-asc",
+            Self::Format => "format",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "name-desc" => Self::NameDesc,
+            "modified" | "modified-desc" => Self::ModifiedDesc,
+            "modified-asc" => Self::ModifiedAsc,
+            "size" | "size-desc" => Self::SizeDesc,
+            "size-asc" => Self::SizeAsc,
+            "triangles" | "triangles-desc" => Self::TrianglesDesc,
+            "triangles-asc" => Self::TrianglesAsc,
+            "format" => Self::Format,
+            _ => Self::NameAsc,
+        }
+    }
+
+    fn push_order_by(self, sql: &mut String) {
+        // Filename is the last `/`-separated component. Missing bbox / triangle
+        // counts sort last in both directions.
+        const NAME: &str =
+            "replace(a.rel_path, rtrim(a.rel_path, replace(a.rel_path, '/', '')), '') COLLATE NOCASE";
+        sql.push_str(" ORDER BY ");
+        match self {
+            Self::NameAsc => {
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::NameDesc => {
+                sql.push_str(NAME);
+                sql.push_str(" DESC, a.rel_path COLLATE NOCASE DESC");
+            }
+            Self::ModifiedDesc => {
+                sql.push_str("a.mtime_ns DESC, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::ModifiedAsc => {
+                sql.push_str("a.mtime_ns ASC, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::SizeDesc => {
+                sql.push_str("(a.bbox_min_x IS NULL), ");
+                sql.push_str("((a.bbox_max_x - a.bbox_min_x) * (a.bbox_max_y - a.bbox_min_y) * (a.bbox_max_z - a.bbox_min_z)) DESC, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::SizeAsc => {
+                sql.push_str("(a.bbox_min_x IS NULL), ");
+                sql.push_str("((a.bbox_max_x - a.bbox_min_x) * (a.bbox_max_y - a.bbox_min_y) * (a.bbox_max_z - a.bbox_min_z)) ASC, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::TrianglesDesc => {
+                sql.push_str("(a.triangle_count IS NULL), a.triangle_count DESC, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::TrianglesAsc => {
+                sql.push_str("(a.triangle_count IS NULL), a.triangle_count ASC, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+            Self::Format => {
+                sql.push_str("CASE a.format WHEN 'threemf' THEN 0 WHEN 'obj' THEN 1 WHEN 'stl' THEN 2 ELSE 3 END, ");
+                sql.push_str(NAME);
+                sql.push_str(" ASC, a.rel_path COLLATE NOCASE ASC");
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AssetQuery {
     pub library_id: Option<i64>,
     pub tag: Option<String>,
     pub search: Option<String>,
     pub thumb_state: Option<ThumbState>,
+    /// Skip libraries whose root is missing (e.g. NAS offline).
+    pub online_only: bool,
     pub limit: Option<usize>,
+    pub sort: AssetSort,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -182,9 +303,27 @@ impl Catalog {
         })
     }
 
+    /// Forget a library and its assets. Files on disk are untouched.
     pub fn remove_library(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM libraries WHERE id = ?1", params![id])?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // assets_fts is contentless and not covered by the FK cascade.
+        tx.execute(
+            "DELETE FROM assets_fts WHERE rowid IN (SELECT id FROM assets WHERE library_id = ?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM libraries WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop one asset from the index (after its file was trashed).
+    pub fn remove_asset(&self, id: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id])?;
+        tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -221,28 +360,37 @@ impl Catalog {
         on_progress(0, total);
 
         let mut seen = HashSet::new();
-        for (i, (path, format)) in files.into_iter().enumerate() {
-            let rel = match path.strip_prefix(&library.root_path) {
-                Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            seen.insert(rel.clone());
-            let meta = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => {
-                    stats.skipped += 1;
-                    on_progress(i as u32 + 1, total);
-                    continue;
+        let mut done = 0u32;
+        // Stat outside the lock, then write each chunk in one transaction so
+        // queries from the UI thread can interleave between chunks.
+        for chunk in files.chunks(SCAN_CHUNK) {
+            let mut entries = Vec::with_capacity(chunk.len());
+            for (path, format) in chunk {
+                let rel = match path.strip_prefix(&library.root_path) {
+                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                    Err(_) => continue,
+                };
+                seen.insert(rel.clone());
+                match std::fs::metadata(path) {
+                    Ok(meta) => entries.push((rel, *format, meta.len() as i64, mtime_ns(&meta))),
+                    Err(_) => stats.skipped += 1,
                 }
-            };
-            let size = meta.len() as i64;
-            let mtime = mtime_ns(&meta);
-            self.upsert_asset(library.id, &rel, format, size, mtime, &mut stats)?;
-            on_progress(i as u32 + 1, total);
+            }
+            {
+                let mut conn = self.conn.lock().unwrap();
+                let tx = conn.transaction()?;
+                for (rel, format, size, mtime) in &entries {
+                    upsert_asset(&tx, library.id, rel, *format, *size, *mtime, &mut stats)?;
+                }
+                tx.commit()?;
+            }
+            done += chunk.len() as u32;
+            on_progress(done, total);
         }
 
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, rel_path FROM assets WHERE library_id = ?1")?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT id, rel_path FROM assets WHERE library_id = ?1")?;
         let stale: Vec<i64> = stmt
             .query_map(params![library.id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -253,65 +401,20 @@ impl Catalog {
             .collect();
         drop(stmt);
         for id in stale {
-            let _ = conn.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id]);
-            conn.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
+            let _ = tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id]);
+            tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
             stats.removed += 1;
         }
+        tx.commit()?;
         Ok(stats)
     }
 
-    fn upsert_asset(
-        &self,
-        library_id: i64,
-        rel: &str,
-        format: AssetFormat,
-        size: i64,
-        mtime: i64,
-        stats: &mut ScanStats,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let existing: Option<(i64, i64, i64)> = conn
-            .query_row(
-                "SELECT id, size_bytes, mtime_ns FROM assets WHERE library_id = ?1 AND rel_path = ?2",
-                params![library_id, rel],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-
-        match existing {
-            Some((_id, old_size, old_mtime)) if old_size == size && old_mtime == mtime => {
-                stats.skipped += 1;
-            }
-            Some((id, _, _)) => {
-                conn.execute(
-                    "UPDATE assets SET format=?1, size_bytes=?2, mtime_ns=?3, thumb_state='pending', error=NULL, content_sha256=NULL
-                     WHERE id=?4",
-                    params![format.as_str(), size, mtime, id],
-                )?;
-                stats.updated += 1;
-            }
-            None => {
-                conn.execute(
-                    "INSERT INTO assets (library_id, rel_path, format, size_bytes, mtime_ns)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![library_id, rel, format.as_str(), size, mtime],
-                )?;
-                let id = conn.last_insert_rowid();
-                let name = Path::new(rel)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(rel);
-                let _ = conn.execute(
-                    "INSERT INTO assets_fts (rowid, name, rel_path, tags) VALUES (?1, ?2, ?3, '')",
-                    params![id, name, rel],
-                );
-                stats.added += 1;
-            }
-        }
-        Ok(())
-    }
-
     pub fn assets(&self, query: &AssetQuery) -> Result<Vec<Asset>> {
+        let online = if query.online_only {
+            Some(self.online_library_ids()?)
+        } else {
+            None
+        };
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
             "SELECT a.id, a.library_id, l.root_path, a.rel_path, a.format, a.size_bytes, a.mtime_ns,
@@ -342,8 +445,8 @@ impl Catalog {
                         SELECT at.asset_id FROM asset_tags at
                         JOIN tags t ON t.id = at.tag_id
                         WHERE t.name LIKE ? ESCAPE '\\'
-                      ) OR CAST(a.id AS TEXT) IN (
-                        SELECT CAST(rowid AS TEXT) FROM assets_fts WHERE assets_fts MATCH ?
+                      ) OR a.id IN (
+                        SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
                       ))",
                 );
                 args.push(like.clone().into());
@@ -355,7 +458,14 @@ impl Catalog {
             sql.push_str(" AND a.thumb_state = ?");
             args.push(state.as_str().to_string().into());
         }
-        sql.push_str(" ORDER BY a.rel_path COLLATE NOCASE");
+        if let Some(ids) = online {
+            sql.push_str(&format!(
+                " AND a.library_id IN ({})",
+                placeholders(ids.len())
+            ));
+            args.extend(ids.into_iter().map(Into::into));
+        }
+        query.sort.push_order_by(&mut sql);
         if let Some(limit) = query.limit {
             sql.push_str(" LIMIT ?");
             args.push((limit as i64).into());
@@ -402,33 +512,102 @@ impl Catalog {
         drop(rows);
         drop(stmt);
 
-        for asset in &mut out {
-            let mut tag_stmt =
-                conn.prepare("SELECT t.name FROM tags t JOIN asset_tags at ON at.tag_id = t.id WHERE at.asset_id = ?1 ORDER BY t.name")?;
-            asset.tags = tag_stmt
-                .query_map(params![asset.id], |r| r.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+        if !out.is_empty() {
+            let index: HashMap<i64, usize> =
+                out.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+            let ids = format!(
+                "[{}]",
+                out.iter()
+                    .map(|a| a.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let mut tag_stmt = conn.prepare(
+                "SELECT at.asset_id, t.name FROM asset_tags at
+                 JOIN tags t ON t.id = at.tag_id
+                 WHERE at.asset_id IN (SELECT value FROM json_each(?1))
+                 ORDER BY t.name",
+            )?;
+            let rows = tag_stmt.query_map(params![ids], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for (asset_id, name) in rows.filter_map(|r| r.ok()) {
+                if let Some(&i) = index.get(&asset_id) {
+                    out[i].tags.push(name);
+                }
+            }
         }
         Ok(out)
     }
 
+    /// Libraries whose root is currently reachable.
+    fn online_library_ids(&self) -> Result<Vec<i64>> {
+        Ok(self
+            .libraries()?
+            .into_iter()
+            .filter(|l| l.root_path.is_dir())
+            .map(|l| l.id)
+            .collect())
+    }
+
+    /// Pending thumbnails in online libraries only: an offline file can't be
+    /// read, and marking it `failed` would stick after it comes back.
     pub fn pending_thumbs(&self, limit: usize) -> Result<Vec<Asset>> {
         self.assets(&AssetQuery {
             thumb_state: Some(ThumbState::Pending),
+            online_only: true,
             limit: Some(limit),
             ..Default::default()
         })
     }
 
+    /// Counts what [`Self::pending_thumbs`] would process.
     pub fn pending_count(&self) -> Result<u32> {
+        let online = self.online_library_ids()?;
         let conn = self.conn.lock().unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM assets WHERE thumb_state = 'pending'",
-            [],
-            |r| r.get(0),
-        )?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM assets WHERE thumb_state = 'pending' AND library_id IN ({})",
+            placeholders(online.len())
+        );
+        let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(online), |r| r.get(0))?;
         Ok(n as u32)
+    }
+
+    /// Reset `ready` / `embedded` assets to `pending` when `thumb_exists` says
+    /// their cached PNG is gone (the OS or the user may clear the cache dir).
+    /// Returns how many were requeued.
+    pub fn requeue_missing_thumbs(&self, thumb_exists: impl Fn(&str) -> bool) -> Result<u32> {
+        let rows: Vec<(i64, Option<Vec<u8>>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, content_sha256 FROM assets WHERE thumb_state IN ('ready', 'embedded')",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Stat files without holding the DB lock.
+        let missing: Vec<i64> = rows
+            .into_iter()
+            .filter(|(_, sha)| {
+                sha.as_deref()
+                    .is_none_or(|b| !thumb_exists(&crate::paths::hex_sha256(b)))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE assets SET thumb_state='pending', error=NULL WHERE id=?1")?;
+            for id in &missing {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(missing.len() as u32)
     }
 
     pub fn set_mesh_meta(&self, id: i64, sha: &[u8], triangles: i64, bbox: &BBox) -> Result<()> {
@@ -532,6 +711,56 @@ impl Catalog {
     }
 }
 
+fn upsert_asset(
+    conn: &Connection,
+    library_id: i64,
+    rel: &str,
+    format: AssetFormat,
+    size: i64,
+    mtime: i64,
+    stats: &mut ScanStats,
+) -> Result<()> {
+    let existing: Option<(i64, i64, i64)> = conn
+        .query_row(
+            "SELECT id, size_bytes, mtime_ns FROM assets WHERE library_id = ?1 AND rel_path = ?2",
+            params![library_id, rel],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+
+    match existing {
+        Some((_id, old_size, old_mtime)) if old_size == size && old_mtime == mtime => {
+            stats.skipped += 1;
+        }
+        Some((id, _, _)) => {
+            conn.execute(
+                "UPDATE assets SET format=?1, size_bytes=?2, mtime_ns=?3, thumb_state='pending', error=NULL, content_sha256=NULL
+                 WHERE id=?4",
+                params![format.as_str(), size, mtime, id],
+            )?;
+            stats.updated += 1;
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO assets (library_id, rel_path, format, size_bytes, mtime_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![library_id, rel, format.as_str(), size, mtime],
+            )?;
+            let id = conn.last_insert_rowid();
+            let name = Path::new(rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(rel);
+            let _ = conn.execute(
+                "INSERT INTO assets_fts (rowid, name, rel_path, tags) VALUES (?1, ?2, ?3, '')",
+                params![id, name, rel],
+            );
+            stats.added += 1;
+        }
+    }
+    Ok(())
+}
+
 fn collect_mesh_files(root: &Path) -> Vec<(PathBuf, AssetFormat)> {
     WalkDir::new(root)
         .follow_links(true)
@@ -574,6 +803,16 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// `?, ?, ?` for an `IN (...)` list; `NULL` when empty so the SQL stays valid
+/// and matches nothing.
+fn placeholders(n: usize) -> String {
+    if n == 0 {
+        "NULL".into()
+    } else {
+        vec!["?"; n].join(", ")
+    }
 }
 
 fn fts_query(s: &str) -> String {
@@ -648,6 +887,37 @@ mod tests {
     }
 
     #[test]
+    fn assets_attach_sorted_tags_to_each_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.stl", "b.stl", "c.stl"] {
+            fs::write(dir.path().join(name), b"solid x\nendsolid x\n").unwrap();
+        }
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let assets = cat.assets(&AssetQuery::default()).unwrap();
+        let id = |n: &str| assets.iter().find(|a| a.name() == n).unwrap().id;
+        cat.set_tags(id("a.stl"), &["zeta".into(), "alpha".into()])
+            .unwrap();
+        cat.set_tags(id("b.stl"), &["mid".into()]).unwrap();
+
+        let assets = cat.assets(&AssetQuery::default()).unwrap();
+        let tags = |n: &str| assets.iter().find(|a| a.name() == n).unwrap().tags.clone();
+        assert_eq!(tags("a.stl"), vec!["alpha".to_string(), "zeta".to_string()]);
+        assert_eq!(tags("b.stl"), vec!["mid".to_string()]);
+        assert!(tags("c.stl").is_empty());
+
+        let by_tag = cat
+            .assets(&AssetQuery {
+                search: Some("zet".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_tag.len(), 1);
+        assert_eq!(by_tag[0].name(), "a.stl");
+    }
+
+    #[test]
     fn offline_library_keeps_index() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("keep.stl"), b"solid x\nendsolid x\n").unwrap();
@@ -675,5 +945,416 @@ mod tests {
         cat.scan_library(&lib).unwrap();
         assert_eq!(cat.pending_count().unwrap(), 2);
         assert_eq!(cat.pending_thumbs(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_file_catalog_roundtrip_and_remove_library() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.stl"), b"solid x\nendsolid x\n").unwrap();
+        let db = dir.path().join("catalog.sqlite");
+        let cat = Catalog::open(&db).unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        assert_eq!(cat.libraries().unwrap().len(), 1);
+        cat.remove_library(lib.id).unwrap();
+        assert!(cat.libraries().unwrap().is_empty());
+        assert!(cat.assets(&AssetQuery::default()).unwrap().is_empty());
+    }
+
+    fn fts_rows(cat: &Catalog) -> i64 {
+        cat.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM assets_fts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn pending_thumbs_skip_offline_libraries() {
+        let online = tempfile::tempdir().unwrap();
+        let offline = tempfile::tempdir().unwrap();
+        fs::write(online.path().join("a.stl"), b"solid x\nendsolid x\n").unwrap();
+        fs::write(offline.path().join("b.stl"), b"solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        for dir in [&online, &offline] {
+            let lib = cat.add_library(dir.path()).unwrap();
+            cat.scan_library(&lib).unwrap();
+        }
+        assert_eq!(cat.pending_count().unwrap(), 2);
+
+        let offline_root = offline.path().to_path_buf();
+        offline.close().unwrap();
+        let pending = cat.pending_thumbs(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rel_path, "a.stl");
+        assert_eq!(cat.pending_count().unwrap(), 1);
+        // Still indexed, just not processed.
+        assert_eq!(cat.assets(&AssetQuery::default()).unwrap().len(), 2);
+
+        fs::create_dir(&offline_root).unwrap();
+        fs::write(offline_root.join("b.stl"), b"solid x\nendsolid x\n").unwrap();
+        assert_eq!(cat.pending_count().unwrap(), 2);
+        fs::remove_dir_all(&offline_root).unwrap();
+    }
+
+    #[test]
+    fn remove_library_clears_search_index() {
+        let keep = tempfile::tempdir().unwrap();
+        let gone = tempfile::tempdir().unwrap();
+        fs::write(keep.path().join("keep.stl"), b"solid x\nendsolid x\n").unwrap();
+        fs::write(gone.path().join("gone.stl"), b"solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let keep_lib = cat.add_library(keep.path()).unwrap();
+        let gone_lib = cat.add_library(gone.path()).unwrap();
+        cat.scan_library(&keep_lib).unwrap();
+        cat.scan_library(&gone_lib).unwrap();
+        assert_eq!(fts_rows(&cat), 2);
+
+        cat.remove_library(gone_lib.id).unwrap();
+        assert_eq!(fts_rows(&cat), 1);
+        let search = |q: &str| {
+            cat.assets(&AssetQuery {
+                search: Some(q.into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len()
+        };
+        assert_eq!(search("keep"), 1);
+        assert_eq!(search("gone"), 0);
+    }
+
+    #[test]
+    fn remove_asset_drops_row_tags_and_search_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.stl"), b"solid x\nendsolid x\n").unwrap();
+        fs::write(dir.path().join("b.stl"), b"solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let a = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "a.stl")
+            .unwrap();
+        cat.set_tags(a.id, &["benchy".into()]).unwrap();
+
+        cat.remove_asset(a.id).unwrap();
+        let left = cat.assets(&AssetQuery::default()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].rel_path, "b.stl");
+        assert_eq!(fts_rows(&cat), 1);
+        assert_eq!(cat.all_tags().unwrap(), vec![("benchy".to_string(), 0)]);
+    }
+
+    #[test]
+    fn scan_skips_hidden_dirs_and_non_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".cache")).unwrap();
+        fs::write(
+            root.join(".cache").join("hidden.stl"),
+            b"solid x\nendsolid x\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes.txt"), b"hello").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(
+            root.join("sub").join("ok.obj"),
+            b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+        )
+        .unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        let stats = cat.scan_library(&lib).unwrap();
+        assert_eq!(stats.added, 1);
+        let assets = cat.assets(&AssetQuery::default()).unwrap();
+        assert_eq!(assets[0].rel_path, "sub/ok.obj");
+        assert!(assets[0].abs_path().ends_with("sub/ok.obj"));
+    }
+
+    #[test]
+    fn mesh_meta_hash_and_thumb_state() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.stl"), b"solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let asset = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        let sha = cat.hash_asset(&asset).unwrap();
+        assert_eq!(sha.len(), 32);
+        let bbox = BBox {
+            min: [0.0, 0.0, 0.0],
+            max: [10.0, 20.0, 30.0],
+        };
+        cat.set_mesh_meta(asset.id, &sha, 12, &bbox).unwrap();
+        cat.set_thumb_state(asset.id, ThumbState::Ready, None)
+            .unwrap();
+        let updated = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        assert_eq!(updated.triangle_count, Some(12));
+        assert_eq!(updated.thumb_state, ThumbState::Ready);
+        assert_eq!(updated.bbox.unwrap().format_mm(), "10×20×30 mm");
+        assert_eq!(updated.sha256_hex().unwrap().len(), 64);
+        assert_eq!(cat.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn requeue_missing_thumbs_only_touches_finished_assets_without_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["kept.stl", "lost.stl", "failed.stl", "nohash.stl"] {
+            fs::write(dir.path().join(name), name).unwrap();
+        }
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let by_name = |n: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|a| a.rel_path == n)
+                .unwrap()
+        };
+        let kept = by_name("kept.stl");
+        let kept_hex = crate::paths::hex_sha256(&cat.hash_asset(&kept).unwrap());
+        cat.hash_asset(&by_name("lost.stl")).unwrap();
+        cat.set_thumb_state(kept.id, ThumbState::Ready, None)
+            .unwrap();
+        cat.set_thumb_state(by_name("lost.stl").id, ThumbState::Embedded, None)
+            .unwrap();
+        cat.set_thumb_state(by_name("failed.stl").id, ThumbState::Failed, Some("x"))
+            .unwrap();
+        cat.set_thumb_state(by_name("nohash.stl").id, ThumbState::Ready, None)
+            .unwrap();
+
+        let requeued = cat.requeue_missing_thumbs(|hex| hex == kept_hex).unwrap();
+        assert_eq!(requeued, 2);
+        assert_eq!(by_name("kept.stl").thumb_state, ThumbState::Ready);
+        assert_eq!(by_name("lost.stl").thumb_state, ThumbState::Pending);
+        assert_eq!(by_name("nohash.stl").thumb_state, ThumbState::Pending);
+        assert_eq!(by_name("failed.stl").thumb_state, ThumbState::Failed);
+        assert_eq!(cat.requeue_missing_thumbs(|_| true).unwrap(), 0);
+    }
+
+    #[test]
+    fn search_escapes_like_wildcards_and_filters_by_library() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("100%.stl"), b"solid x\nendsolid x\n").unwrap();
+        fs::write(dir.path().join("other.stl"), b"solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let found = cat
+            .assets(&AssetQuery {
+                search: Some("100%".into()),
+                library_id: Some(lib.id),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "100%.stl");
+        let limited = cat
+            .assets(&AssetQuery {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    fn names_of(assets: &[Asset]) -> Vec<&str> {
+        assets.iter().map(|a| a.name()).collect()
+    }
+
+    fn write_mesh(path: &std::path::Path) {
+        fs::write(path, b"solid x\nendsolid x\n").unwrap();
+    }
+
+    fn set_mtime(path: &std::path::Path, secs: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn assets_sort_by_name_filename_not_rel_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("a")).unwrap();
+        write_mesh(&root.join("b.stl"));
+        write_mesh(&root.join("a/z.stl"));
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        cat.scan_library(&lib).unwrap();
+
+        let asc = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::NameAsc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(names_of(&asc), ["b.stl", "z.stl"]);
+
+        let desc = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::NameDesc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(names_of(&desc), ["z.stl", "b.stl"]);
+    }
+
+    #[test]
+    fn assets_sort_by_mtime_size_triangles_and_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_mesh(&root.join("old.stl"));
+        write_mesh(&root.join("new.stl"));
+        fs::write(root.join("mid.obj"), b"v 0 0 0\n").unwrap();
+        fs::write(root.join("plate.3mf"), b"pk").unwrap();
+        set_mtime(&root.join("old.stl"), 100);
+        set_mtime(&root.join("new.stl"), 300);
+        set_mtime(&root.join("mid.obj"), 200);
+        set_mtime(&root.join("plate.3mf"), 250);
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        cat.scan_library(&lib).unwrap();
+
+        let by_id = |name: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|a| a.name() == name)
+                .unwrap()
+                .id
+        };
+        let small = BBox {
+            min: [0.0, 0.0, 0.0],
+            max: [10.0, 10.0, 10.0],
+        };
+        let large = BBox {
+            min: [0.0, 0.0, 0.0],
+            max: [50.0, 10.0, 10.0],
+        };
+        cat.set_mesh_meta(by_id("old.stl"), &[0u8; 32], 10, &small)
+            .unwrap();
+        cat.set_mesh_meta(by_id("new.stl"), &[1u8; 32], 100, &large)
+            .unwrap();
+        cat.set_mesh_meta(by_id("mid.obj"), &[2u8; 32], 50, &small)
+            .unwrap();
+
+        let newest = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::ModifiedDesc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            names_of(&newest),
+            ["new.stl", "plate.3mf", "mid.obj", "old.stl"]
+        );
+
+        let oldest = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::ModifiedAsc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            names_of(&oldest),
+            ["old.stl", "mid.obj", "plate.3mf", "new.stl"]
+        );
+
+        let largest = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::SizeDesc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(largest[0].name(), "new.stl");
+        assert_eq!(largest.last().unwrap().name(), "plate.3mf");
+
+        let smallest = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::SizeAsc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(smallest.last().unwrap().name(), "plate.3mf");
+        assert!(smallest[0].name() == "old.stl" || smallest[0].name() == "mid.obj");
+
+        let most = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::TrianglesDesc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(names_of(&most)[..3], ["new.stl", "mid.obj", "old.stl"]);
+        assert_eq!(most.last().unwrap().name(), "plate.3mf");
+
+        let fewest = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::TrianglesAsc,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(fewest[0].name(), "old.stl");
+        assert_eq!(fewest.last().unwrap().name(), "plate.3mf");
+
+        let format = cat
+            .assets(&AssetQuery {
+                sort: AssetSort::Format,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            format.iter().map(|a| a.format).collect::<Vec<_>>(),
+            vec![
+                AssetFormat::ThreeMf,
+                AssetFormat::Obj,
+                AssetFormat::Stl,
+                AssetFormat::Stl
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_sort_parse_roundtrip() {
+        for sort in AssetSort::ALL {
+            assert_eq!(AssetSort::parse(sort.as_str()), sort);
+        }
+        assert_eq!(AssetSort::parse("modified-desc"), AssetSort::ModifiedDesc);
+        assert_eq!(AssetSort::parse("nope"), AssetSort::NameAsc);
+        assert_eq!(AssetSort::parse("  SIZE  "), AssetSort::SizeDesc);
+    }
+
+    #[test]
+    fn set_tags_ignores_blanks_and_updates_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.stl"), b"solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let id = cat.assets(&AssetQuery::default()).unwrap()[0].id;
+        cat.set_tags(id, &["  ".into(), "boat".into(), "boat".into()])
+            .unwrap();
+        let tags = cat.all_tags().unwrap();
+        assert_eq!(tags, vec![("boat".into(), 1)]);
+        cat.set_tags(id, &[]).unwrap();
+        let tags = cat.all_tags().unwrap();
+        assert_eq!(tags, vec![("boat".into(), 0)]);
+    }
+
+    #[test]
+    fn thumb_state_parse_roundtrip() {
+        for state in [
+            ThumbState::Pending,
+            ThumbState::Ready,
+            ThumbState::Failed,
+            ThumbState::Embedded,
+        ] {
+            assert_eq!(ThumbState::parse(state.as_str()), state);
+        }
+        assert_eq!(ThumbState::parse("unknown"), ThumbState::Pending);
     }
 }

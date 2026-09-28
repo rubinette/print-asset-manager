@@ -1,4 +1,4 @@
-use image::{Rgba, RgbaImage};
+use image::RgbaImage;
 use pam_core::Mesh;
 
 const MAX_PREVIEW_TRIS: usize = 500_000;
@@ -38,14 +38,20 @@ impl Camera {
 }
 
 pub fn render_thumbnail(mesh: &Mesh, size: u32) -> RgbaImage {
-    render_mesh(mesh, &Camera::isometric(), size, size)
+    render_mesh(mesh, &Camera::isometric(), size, size, BG)
 }
 
-pub fn render_mesh(mesh: &Mesh, camera: &Camera, width: u32, height: u32) -> RgbaImage {
+pub fn render_mesh(
+    mesh: &Mesh,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    background: [u8; 4],
+) -> RgbaImage {
     let mesh = mesh.simplified(MAX_PREVIEW_TRIS);
     let w = width.max(1) as i32;
     let h = height.max(1) as i32;
-    let mut color = vec![BG; (w * h) as usize];
+    let mut color = vec![background; (w * h) as usize];
     let mut zbuf = vec![f32::INFINITY; (w * h) as usize];
 
     if mesh.is_empty() || !mesh.bbox.is_valid() {
@@ -104,14 +110,11 @@ pub fn encode_png(img: &RgbaImage) -> Vec<u8> {
 }
 
 fn to_image(width: u32, height: u32, color: &[[u8; 4]]) -> RgbaImage {
-    let mut img = RgbaImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            let c = color[(y * width + x) as usize];
-            img.put_pixel(x, y, Rgba(c));
-        }
+    if width == 0 || height == 0 {
+        return RgbaImage::new(width, height);
     }
-    img
+    let raw: Vec<u8> = color.iter().flatten().copied().collect();
+    RgbaImage::from_raw(width, height, raw).expect("buffer matches dimensions")
 }
 
 fn view_matrix(camera: &Camera, center: [f32; 3], radius: f32) -> ([[f32; 4]; 4], [f32; 3]) {
@@ -197,12 +200,13 @@ fn fill_triangle(
     if area.abs() < 1e-6 {
         return;
     }
+    let inv_area = 1.0 / area;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) / area;
-            let w1 = edge(c, a, p) / area;
-            let w2 = edge(a, b, p) / area;
+            let w0 = edge(b, c, p) * inv_area;
+            let w1 = edge(c, a, p) * inv_area;
+            let w2 = edge(a, b, p) * inv_area;
             if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                 continue;
             }
@@ -265,6 +269,67 @@ mod tests {
         assert!(
             painted > 80,
             "expected a visible cube, got {painted} pixels"
+        );
+    }
+
+    fn unit_cube() -> Mesh {
+        Mesh::from_triangles(&[
+            [[0., 0., 0.], [1., 0., 0.], [1., 1., 0.]],
+            [[0., 0., 0.], [1., 1., 0.], [0., 1., 0.]],
+            [[0., 0., 1.], [1., 1., 1.], [1., 0., 1.]],
+            [[0., 0., 1.], [0., 1., 1.], [1., 1., 1.]],
+            [[0., 0., 0.], [0., 0., 1.], [1., 0., 1.]],
+            [[0., 0., 0.], [1., 0., 1.], [1., 0., 0.]],
+            [[0., 1., 0.], [1., 1., 0.], [1., 1., 1.]],
+            [[0., 1., 0.], [1., 1., 1.], [0., 1., 1.]],
+            [[0., 0., 0.], [0., 1., 0.], [0., 1., 1.]],
+            [[0., 0., 0.], [0., 1., 1.], [0., 0., 1.]],
+            [[1., 0., 0.], [1., 0., 1.], [1., 1., 1.]],
+            [[1., 0., 0.], [1., 1., 1.], [1., 1., 0.]],
+        ])
+    }
+
+    #[test]
+    fn empty_mesh_fills_custom_background() {
+        let mesh = Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            bbox: pam_core::BBox::empty(),
+        };
+        let bg = [9, 8, 7, 255];
+        let img = render_mesh(&mesh, &Camera::default(), 4, 4, bg);
+        assert!(img.pixels().all(|p| p.0 == bg));
+    }
+
+    #[test]
+    fn encode_png_writes_png_header() {
+        let img = render_thumbnail(&unit_cube(), 16);
+        let bytes = encode_png(&img);
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn camera_orbit_and_zoom_clamp() {
+        let mut cam = Camera::isometric();
+        cam.orbit(0.0, 10_000.0);
+        assert!((cam.pitch - 1.45).abs() < 1e-5);
+        cam.orbit(0.0, -10_000.0);
+        assert!((cam.pitch + 1.45).abs() < 1e-5);
+        cam.zoom(1_000_000.0);
+        assert_eq!(cam.distance, 0.4);
+        cam.zoom(-1_000_000.0);
+        assert_eq!(cam.distance, 12.0);
+    }
+
+    #[test]
+    fn orbiting_still_paints_the_cube() {
+        let mut cam = Camera::default();
+        cam.orbit(80.0, -20.0);
+        let img = render_mesh(&unit_cube(), &cam, 48, 48, BG);
+        let painted = img.pixels().filter(|p| p.0 != BG).count();
+        assert!(
+            painted > 40,
+            "expected visible cube after orbit, got {painted}"
         );
     }
 }

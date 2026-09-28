@@ -18,12 +18,12 @@ cargo run -p pam-app --release
 
 啟動後點「加入資料夾」，選一個含 `.stl` / `.3mf` / `.obj` 的目錄。原檔留在原處；索引存在：
 
-- macOS：`~/Library/Application Support/print-asset-manager/catalog.sqlite`
+- macOS：`~/Library/Application Support/dev.print-asset-manager.print-asset-manager/catalog.sqlite`
 - Linux：`~/.local/share/print-asset-manager/catalog.sqlite`
 
 縮圖快取：
 
-- macOS：`~/Library/Caches/print-asset-manager/thumbs/`
+- macOS：`~/Library/Caches/dev.print-asset-manager.print-asset-manager/thumbs/`
 - Linux：`~/.cache/print-asset-manager/thumbs/`
 
 ## 操作
@@ -33,9 +33,13 @@ cargo run -p pam-app --release
 | 加入資料夾 | ⌘O / Ctrl+O |
 | 搜尋 | ⌘F / Ctrl+F |
 | 打開（系統預設切片軟體） | Enter |
+| 將選取的檔案移到垃圾桶（會先確認） | ⌘⌫ / Delete |
 | 結束 | ⌘Q / Ctrl+Q |
 
 預覽區：拖曳旋轉、滾輪縮放、雙擊重設視角。卡片雙擊等同打開。可把資料夾拖進視窗加入庫。
+
+- **移除資料夾**：在側欄資料夾上按右鍵 →「移除資料夾…」。只從素材庫移除，不會動到磁碟上的檔案。
+- **移除檔案**：在素材上按右鍵 →「移到垃圾桶…」，或用詳細資訊面板的垃圾桶按鈕。原始檔會移到系統垃圾桶（可復原），這是 App 唯一會動到原始檔的操作。
 
 ## 架構
 

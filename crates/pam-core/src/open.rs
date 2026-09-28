@@ -34,3 +34,39 @@ pub fn open_with_template(template: &str, path: &Path) -> Result<()> {
         Err(Error::Message(format!("open command failed: {status}")))
     }
 }
+
+/// Move a file to the system Trash (recoverable), never a hard delete.
+pub fn move_to_trash(path: &Path) -> Result<()> {
+    #[allow(unused_mut)]
+    let mut ctx = trash::TrashContext::default();
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        // The default Finder method needs Automation permission to script Finder.
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    ctx.delete(path)
+        .map_err(|e| Error::Message(format!("failed to move {} to Trash: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn empty_template_errors() {
+        let err = open_with_template("   ", Path::new("a.stl")).unwrap_err();
+        assert!(err.to_string().contains("empty open command"));
+    }
+
+    #[test]
+    fn true_template_succeeds() {
+        open_with_template("true {path}", Path::new("/tmp/model.stl")).unwrap();
+    }
+
+    #[test]
+    fn false_template_fails() {
+        assert!(open_with_template("false {path}", Path::new("a.stl")).is_err());
+    }
+}

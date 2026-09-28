@@ -17,3 +17,8 @@ gpui-kit.workspace = true
 image.workspace = true
 pam-core.workspace = true
 pam-preview.workspace = true
+sys-locale.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

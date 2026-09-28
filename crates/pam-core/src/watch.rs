@@ -10,6 +10,7 @@ use crate::error::Result;
 
 enum WatchCmd {
     Watch(PathBuf),
+    Unwatch(PathBuf),
     Shutdown,
 }
 
@@ -41,6 +42,10 @@ impl WatchHandle {
 
     pub fn watch(&self, root: PathBuf) {
         let _ = self.cmd_tx.send(WatchCmd::Watch(root));
+    }
+
+    pub fn unwatch(&self, root: PathBuf) {
+        let _ = self.cmd_tx.send(WatchCmd::Unwatch(root));
     }
 
     pub fn drain(&self, wait: Duration) -> Vec<PathBuf> {
@@ -77,6 +82,11 @@ fn watch_thread(cmd_rx: Receiver<WatchCmd>, event_tx: Sender<PathBuf>) {
                 }
                 if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
                     watched.remove(&root);
+                }
+            }
+            WatchCmd::Unwatch(root) => {
+                if watched.remove(&root) {
+                    let _ = watcher.unwatch(&root);
                 }
             }
             WatchCmd::Shutdown => break,
@@ -134,5 +144,39 @@ mod tests {
             }
         }
         assert!(found, "watcher should observe the new stl");
+    }
+
+    #[test]
+    fn drain_debounced_timeout_is_empty() {
+        let (_tx, rx) = mpsc::channel();
+        let paths = drain_debounced(&rx, Duration::from_millis(5));
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn drain_debounced_sorts_and_dedups() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(PathBuf::from("/b")).unwrap();
+        tx.send(PathBuf::from("/a")).unwrap();
+        tx.send(PathBuf::from("/a")).unwrap();
+        let paths = drain_debounced(&rx, Duration::from_millis(20));
+        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn affected_library_prefers_longest_root() {
+        let libs = vec![
+            crate::catalog::Library {
+                id: 1,
+                root_path: PathBuf::from("/lib"),
+            },
+            crate::catalog::Library {
+                id: 2,
+                root_path: PathBuf::from("/lib/nested"),
+            },
+        ];
+        let hit = affected_library(Path::new("/lib/nested/a.stl"), &libs).unwrap();
+        assert_eq!(hit.id, 2);
+        assert!(affected_library(Path::new("/other/a.stl"), &libs).is_none());
     }
 }
