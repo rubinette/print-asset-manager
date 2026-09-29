@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS asset_tags (
 
 CREATE INDEX IF NOT EXISTS idx_assets_thumb_state ON assets(thumb_state);
 CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag_id);
+CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(content_sha256);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
   name, rel_path, tags, content='', contentless_delete=1
@@ -184,12 +185,17 @@ impl AssetSort {
         }
     }
 
-    fn push_order_by(self, sql: &mut String) {
+    /// `group_by_hash` keeps identical files next to each other, ahead of the
+    /// chosen sort (for the duplicates view).
+    fn push_order_by(self, sql: &mut String, group_by_hash: bool) {
         // Filename is the last `/`-separated component. Missing bbox / triangle
         // counts sort last in both directions.
         const NAME: &str =
             "replace(a.rel_path, rtrim(a.rel_path, replace(a.rel_path, '/', '')), '') COLLATE NOCASE";
         sql.push_str(" ORDER BY ");
+        if group_by_hash {
+            sql.push_str("a.content_sha256, ");
+        }
         match self {
             Self::NameAsc => {
                 sql.push_str(NAME);
@@ -240,10 +246,35 @@ impl AssetSort {
     }
 }
 
+/// How [`AssetQuery::tags`] combines several tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TagMode {
+    /// Asset has every tag.
+    #[default]
+    All,
+    /// Asset has at least one of the tags.
+    Any,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AssetQuery {
     pub library_id: Option<i64>,
-    pub tag: Option<String>,
+    /// Folder inside `library_id` (`/`-separated, relative to its root);
+    /// matches assets in it and its subfolders.
+    pub dir: Option<String>,
+    pub tags: Vec<String>,
+    pub tag_mode: TagMode,
+    /// Empty means every format.
+    pub formats: Vec<AssetFormat>,
+    /// Build volume X, Y, Z in mm: keep assets whose bbox fits, turned 90° on
+    /// the bed if need be. Assets without a bbox yet are left out.
+    pub fits_bed: Option<[f32; 3]>,
+    /// File size range in bytes: at least `.0`, below `.1`.
+    pub file_size: Option<(u64, Option<u64>)>,
+    pub modified_since_ns: Option<i64>,
+    pub untagged: bool,
+    /// Only assets whose content hash is shared with another asset.
+    pub duplicates_only: bool,
     pub search: Option<String>,
     pub thumb_state: Option<ThumbState>,
     /// Skip libraries whose root is missing (e.g. NAS offline).
@@ -431,11 +462,65 @@ impl Catalog {
             sql.push_str(" AND a.library_id = ?");
             args.push(id.into());
         }
-        if let Some(tag) = &query.tag {
+        if let Some(dir) = query.dir.as_deref().map(|d| d.trim_matches('/')) {
+            if !dir.is_empty() {
+                sql.push_str(" AND a.rel_path LIKE ? ESCAPE '\\'");
+                args.push(format!("{}/%", escape_like(dir)).into());
+            }
+        }
+        if !query.tags.is_empty() {
+            sql.push_str(&format!(
+                " AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+                   WHERE t.name IN ({}) GROUP BY at.asset_id",
+                placeholders(query.tags.len())
+            ));
+            args.extend(query.tags.iter().map(|t| t.clone().into()));
+            if query.tag_mode == TagMode::All {
+                sql.push_str(" HAVING COUNT(DISTINCT t.id) = ?");
+                let distinct: HashSet<&String> = query.tags.iter().collect();
+                args.push((distinct.len() as i64).into());
+            }
+            sql.push(')');
+        }
+        if query.untagged {
+            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
+        }
+        if !query.formats.is_empty() {
+            sql.push_str(&format!(
+                " AND a.format IN ({})",
+                placeholders(query.formats.len())
+            ));
+            args.extend(query.formats.iter().map(|f| f.as_str().to_string().into()));
+        }
+        if let Some([x, y, z]) = query.fits_bed {
             sql.push_str(
-                " AND a.id IN (SELECT asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id WHERE t.name = ?)",
+                " AND a.bbox_min_x IS NOT NULL
+                  AND (a.bbox_max_z - a.bbox_min_z) <= ?
+                  AND (((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?)
+                    OR ((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?))",
             );
-            args.push(tag.clone().into());
+            for v in [z, x, y, y, x] {
+                args.push(f64::from(v).into());
+            }
+        }
+        if let Some((min, max)) = query.file_size {
+            sql.push_str(" AND a.size_bytes >= ?");
+            args.push((min as i64).into());
+            if let Some(max) = max {
+                sql.push_str(" AND a.size_bytes < ?");
+                args.push((max as i64).into());
+            }
+        }
+        if let Some(since) = query.modified_since_ns {
+            sql.push_str(" AND a.mtime_ns >= ?");
+            args.push(since.into());
+        }
+        if query.duplicates_only {
+            sql.push_str(
+                " AND a.content_sha256 IN (
+                    SELECT content_sha256 FROM assets WHERE content_sha256 IS NOT NULL
+                    GROUP BY content_sha256 HAVING COUNT(*) > 1)",
+            );
         }
         if let Some(search) = query.search.as_ref().map(|s| s.trim().to_string()) {
             if !search.is_empty() {
@@ -465,7 +550,7 @@ impl Catalog {
             ));
             args.extend(ids.into_iter().map(Into::into));
         }
-        query.sort.push_order_by(&mut sql);
+        query.sort.push_order_by(&mut sql, query.duplicates_only);
         if let Some(limit) = query.limit {
             sql.push_str(" LIMIT ?");
             args.push((limit as i64).into());
@@ -676,52 +761,126 @@ impl Catalog {
     }
 
     pub fn set_tags(&self, asset_id: i64, tags: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM asset_tags WHERE asset_id = ?1",
             params![asset_id],
         )?;
         for raw in tags {
-            let name = raw.trim();
-            if name.is_empty() {
-                continue;
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
-                params![name],
-            )?;
-            let tag_id: i64 =
-                conn.query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| {
-                    r.get(0)
-                })?;
-            conn.execute(
-                "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (?1, ?2)",
-                params![asset_id, tag_id],
-            )?;
+            insert_asset_tag(&tx, asset_id, raw)?;
         }
-        let joined = tags
-            .iter()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let name: String = conn.query_row(
-            "SELECT rel_path FROM assets WHERE id=?1",
-            params![asset_id],
-            |r| r.get(0),
-        )?;
-        let file_name = Path::new(&name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&name)
-            .to_string();
-        let _ = conn.execute("DELETE FROM assets_fts WHERE rowid=?1", params![asset_id]);
-        let _ = conn.execute(
-            "INSERT INTO assets_fts (rowid, name, rel_path, tags) VALUES (?1, ?2, ?3, ?4)",
-            params![asset_id, file_name, name, joined],
-        );
+        refresh_fts(&tx, asset_id)?;
+        tx.commit()?;
         Ok(())
     }
+
+    /// Add `tags` to every asset in `ids`, keeping the tags they already have.
+    pub fn add_tags(&self, ids: &[i64], tags: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for &id in ids {
+            for raw in tags {
+                insert_asset_tag(&tx, id, raw)?;
+            }
+            refresh_fts(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Take `tag` off every asset in `ids`.
+    pub fn remove_tag(&self, ids: &[i64], tag: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for &id in ids {
+            tx.execute(
+                "DELETE FROM asset_tags WHERE asset_id = ?1
+                   AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+                params![id, tag],
+            )?;
+            refresh_fts(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Relative paths of every asset in a library, for building its folder tree.
+    pub fn rel_paths(&self, library_id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT rel_path FROM assets WHERE library_id = ?1")?;
+        let rows = stmt.query_map(params![library_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many assets have this content hash (the asset itself included).
+    pub fn copies(&self, sha: &[u8]) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM assets WHERE content_sha256 = ?1",
+            params![sha],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    /// How many assets share their content hash with at least one other asset.
+    pub fn duplicate_count(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(n), 0) FROM (
+               SELECT COUNT(*) AS n FROM assets WHERE content_sha256 IS NOT NULL
+               GROUP BY content_sha256 HAVING COUNT(*) > 1)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+}
+
+/// Attach one tag (created if new) to an asset. Blank names are ignored.
+fn insert_asset_tag(conn: &Connection, asset_id: i64, raw: &str) -> Result<()> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
+        params![name],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id)
+         SELECT ?1, id FROM tags WHERE name = ?2",
+        params![asset_id, name],
+    )?;
+    Ok(())
+}
+
+/// Rewrite an asset's `assets_fts` row from its current path and tags. The
+/// table is contentless and has no triggers, so every tag write calls this.
+fn refresh_fts(conn: &Connection, asset_id: i64) -> Result<()> {
+    let rel: String = conn.query_row(
+        "SELECT rel_path FROM assets WHERE id=?1",
+        params![asset_id],
+        |r| r.get(0),
+    )?;
+    let tags: String = conn.query_row(
+        "SELECT COALESCE(group_concat(t.name, ' '), '') FROM asset_tags at
+         JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = ?1",
+        params![asset_id],
+        |r| r.get(0),
+    )?;
+    let file_name = Path::new(&rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&rel)
+        .to_string();
+    let _ = conn.execute("DELETE FROM assets_fts WHERE rowid=?1", params![asset_id]);
+    let _ = conn.execute(
+        "INSERT INTO assets_fts (rowid, name, rel_path, tags) VALUES (?1, ?2, ?3, ?4)",
+        params![asset_id, file_name, rel, tags],
+    );
+    Ok(())
 }
 
 fn upsert_asset(
@@ -891,7 +1050,7 @@ mod tests {
 
         let tagged = cat
             .assets(&AssetQuery {
-                tag: Some("校準".into()),
+                tags: vec!["校準".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -1400,5 +1559,253 @@ mod tests {
             assert_eq!(ThumbState::parse(state.as_str()), state);
         }
         assert_eq!(ThumbState::parse("unknown"), ThumbState::Pending);
+    }
+
+    /// Library with the given files (relative paths); returns catalog and
+    /// a name → id lookup of its assets.
+    fn catalog_with(root: &Path, files: &[&str]) -> (Catalog, Library, HashMap<String, i64>) {
+        for rel in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_mesh(&path);
+        }
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let ids = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.rel_path, a.id))
+            .collect();
+        (cat, lib, ids)
+    }
+
+    fn rel_paths_of(cat: &Catalog, query: AssetQuery) -> Vec<String> {
+        let mut out: Vec<String> = cat
+            .assets(&query)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.rel_path)
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn dir_filter_matches_folder_and_subfolders_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, _) = catalog_with(
+            dir.path(),
+            &[
+                "top.stl",
+                "a/b/one.stl",
+                "a/b/deep/two.stl",
+                "a/bc/three.stl",
+                "a/b_x/four.stl",
+            ],
+        );
+        let in_dir = |d: &str| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    library_id: Some(lib.id),
+                    dir: Some(d.into()),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(in_dir("a/b"), ["a/b/deep/two.stl", "a/b/one.stl"]);
+        assert_eq!(in_dir("a").len(), 4);
+        // `_` is a LIKE wildcard; it must match literally.
+        assert_eq!(in_dir("a/b_x"), ["a/b_x/four.stl"]);
+        assert_eq!(in_dir("").len(), 5);
+    }
+
+    #[test]
+    fn tags_filter_all_any_and_untagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "c.stl"]);
+        cat.set_tags(ids["a.stl"], &["red".into(), "big".into()])
+            .unwrap();
+        cat.set_tags(ids["b.stl"], &["red".into()]).unwrap();
+        let tagged = |tags: &[&str], tag_mode| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    tag_mode,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(tagged(&["red", "big"], TagMode::All), ["a.stl"]);
+        assert_eq!(tagged(&["red", "big"], TagMode::Any), ["a.stl", "b.stl"]);
+        assert_eq!(tagged(&["big", "big"], TagMode::All), ["a.stl"]);
+        let untagged = rel_paths_of(
+            &cat,
+            AssetQuery {
+                untagged: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(untagged, ["c.stl"]);
+    }
+
+    #[test]
+    fn format_size_and_date_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_mesh(&root.join("a.stl"));
+        fs::write(root.join("b.obj"), vec![b'v'; 4096]).unwrap();
+        fs::write(root.join("c.3mf"), b"pk").unwrap();
+        set_mtime(&root.join("a.stl"), 100);
+        set_mtime(&root.join("b.obj"), 300);
+        set_mtime(&root.join("c.3mf"), 500);
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        cat.scan_library(&lib).unwrap();
+
+        let formats = rel_paths_of(
+            &cat,
+            AssetQuery {
+                formats: vec![AssetFormat::Stl, AssetFormat::ThreeMf],
+                ..Default::default()
+            },
+        );
+        assert_eq!(formats, ["a.stl", "c.3mf"]);
+
+        let small = rel_paths_of(
+            &cat,
+            AssetQuery {
+                file_size: Some((0, Some(1024))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(small, ["a.stl", "c.3mf"]);
+        let large = rel_paths_of(
+            &cat,
+            AssetQuery {
+                file_size: Some((1024, None)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(large, ["b.obj"]);
+
+        let recent = rel_paths_of(
+            &cat,
+            AssetQuery {
+                modified_since_ns: Some(300 * 1_000_000_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(recent, ["b.obj", "c.3mf"]);
+    }
+
+    #[test]
+    fn fits_bed_allows_rotation_and_skips_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _, ids) = catalog_with(
+            dir.path(),
+            &["small.stl", "long.stl", "tall.stl", "wide.stl", "new.stl"],
+        );
+        let size = |x: f32, y: f32, z: f32| BBox {
+            min: [-1.0, -1.0, 0.0],
+            max: [x - 1.0, y - 1.0, z],
+        };
+        cat.set_mesh_meta(ids["small.stl"], &[1], 12, &size(100.0, 100.0, 100.0))
+            .unwrap();
+        // 250 × 150 only fits a 180 × 256 bed turned 90°.
+        cat.set_mesh_meta(ids["long.stl"], &[2], 12, &size(250.0, 150.0, 50.0))
+            .unwrap();
+        cat.set_mesh_meta(ids["tall.stl"], &[3], 12, &size(50.0, 50.0, 300.0))
+            .unwrap();
+        cat.set_mesh_meta(ids["wide.stl"], &[4], 12, &size(260.0, 260.0, 10.0))
+            .unwrap();
+        let fits = rel_paths_of(
+            &cat,
+            AssetQuery {
+                fits_bed: Some([180.0, 256.0, 256.0]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(fits, ["long.stl", "small.stl"]);
+    }
+
+    #[test]
+    fn duplicates_group_by_content_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (cat, _, _) = catalog_with(root, &["x/a.stl", "y/b.stl", "z/c.stl", "d.stl", "e.stl"]);
+        fs::write(root.join("d.stl"), b"solid other\nendsolid other\n").unwrap();
+        fs::write(root.join("e.stl"), b"solid other\nendsolid other\n").unwrap();
+        fs::write(root.join("z/c.stl"), b"solid unique\nendsolid unique\n").unwrap();
+        let lib = cat.libraries().unwrap().remove(0);
+        cat.scan_library(&lib).unwrap();
+        assert_eq!(cat.duplicate_count().unwrap(), 0, "nothing hashed yet");
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            cat.hash_asset(&asset).unwrap();
+        }
+        assert_eq!(cat.duplicate_count().unwrap(), 4);
+        let a = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|a| a.rel_path == "x/a.stl")
+            .unwrap();
+        assert_eq!(cat.copies(a.content_sha256.as_deref().unwrap()).unwrap(), 2);
+        assert_eq!(cat.copies(&[0; 32]).unwrap(), 0);
+
+        let dups = cat
+            .assets(&AssetQuery {
+                duplicates_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(dups.len(), 4);
+        assert!(dups.iter().all(|a| a.rel_path != "z/c.stl"));
+        // Each group is contiguous.
+        let hashes: Vec<_> = dups.iter().map(|a| a.content_sha256.clone()).collect();
+        assert_eq!(hashes[0], hashes[1]);
+        assert_eq!(hashes[2], hashes[3]);
+        assert_ne!(hashes[1], hashes[2]);
+    }
+
+    #[test]
+    fn add_and_remove_tags_in_bulk_keep_search_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "c.stl"]);
+        cat.set_tags(ids["a.stl"], &["keep".into()]).unwrap();
+        let both = [ids["a.stl"], ids["b.stl"]];
+        cat.add_tags(&both, &["gift".into(), " ".into()]).unwrap();
+
+        let search = |q: &str| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    search: Some(q.into()),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(search("gift"), ["a.stl", "b.stl"]);
+        let tags = cat.all_tags().unwrap();
+        assert_eq!(tags, [("gift".to_string(), 2), ("keep".to_string(), 1)]);
+
+        cat.remove_tag(&both, "gift").unwrap();
+        assert!(search("gift").is_empty());
+        // Other tags survive, and FTS still has them.
+        assert_eq!(search("keep"), ["a.stl"]);
+        assert_eq!(fts_rows(&cat), 3);
+    }
+
+    #[test]
+    fn rel_paths_lists_one_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, _) = catalog_with(dir.path(), &["a.stl", "sub/b.stl"]);
+        let mut paths = cat.rel_paths(lib.id).unwrap();
+        paths.sort();
+        assert_eq!(paths, ["a.stl", "sub/b.stl"]);
+        assert!(cat.rel_paths(lib.id + 1).unwrap().is_empty());
     }
 }
