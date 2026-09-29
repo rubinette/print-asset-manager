@@ -22,6 +22,7 @@ actions!(
         SelectRight,
         SelectUp,
         SelectDown,
+        SelectAll,
         TrashSelected
     ]
 );
@@ -51,6 +52,9 @@ fn main() {
             KeyBinding::new("right", SelectRight, Some(workspace::ASSET_VIEW_CONTEXT)),
             KeyBinding::new("up", SelectUp, Some(workspace::ASSET_VIEW_CONTEXT)),
             KeyBinding::new("down", SelectDown, Some(workspace::ASSET_VIEW_CONTEXT)),
+            // Scoped to the asset view so text fields keep their own select-all.
+            KeyBinding::new("cmd-a", SelectAll, Some(workspace::ASSET_VIEW_CONTEXT)),
+            KeyBinding::new("ctrl-a", SelectAll, Some(workspace::ASSET_VIEW_CONTEXT)),
             // Finder's shortcut; plain Delete for Linux file managers. Both confirm first.
             KeyBinding::new(
                 "cmd-backspace",

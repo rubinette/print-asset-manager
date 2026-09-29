@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -13,13 +14,13 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Icon, IconName, Root, Selectable as _, Sizable as _, TitleBar,
-    WindowExt as _,
+    h_flex, v_flex, ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable as _,
+    Sizable as _, TitleBar, WindowExt as _,
 };
 use gpui_kit::{prelude::FluentBuilder as _, Focusable as _, *};
-use pam_core::catalog::{Asset, AssetQuery, AssetSort, Catalog, Library, ThumbState};
+use pam_core::catalog::{Asset, AssetQuery, AssetSort, Catalog, Library, TagMode, ThumbState};
 use pam_core::load::load_mesh;
-use pam_core::mesh::Mesh;
+use pam_core::mesh::{AssetFormat, Mesh};
 use pam_core::open::{move_to_trash, open_path};
 use pam_core::paths::thumb_path;
 use pam_core::watch::{affected_library, WatchHandle};
@@ -29,8 +30,9 @@ use pam_preview::Camera;
 use crate::i18n::{self, Key, LanguagePref};
 use crate::jobs;
 use crate::{
-    apply_language, apply_system_theme, AddFolder, FocusSearch, OpenSelected, SelectDown,
-    SelectLeft, SelectRight, SelectUp, TrashSelected, UseChinese, UseEnglish, UseSystemLanguage,
+    apply_language, apply_system_theme, AddFolder, FocusSearch, OpenSelected, SelectAll,
+    SelectDown, SelectLeft, SelectRight, SelectUp, TrashSelected, UseChinese, UseEnglish,
+    UseSystemLanguage,
 };
 
 /// Key context of the asset grid/list; arrow-key bindings only apply inside it.
@@ -151,6 +153,263 @@ fn step_index(
     (next != current).then_some(next)
 }
 
+/// What the sidebar has picked; filters narrow it further.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+enum Location {
+    #[default]
+    All,
+    /// A library, or a folder inside it (`dir` relative to its root).
+    Library {
+        id: i64,
+        dir: Option<String>,
+    },
+    Duplicates,
+}
+
+/// File size ranges in MB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeBucket {
+    Under1,
+    From1To10,
+    From10To100,
+    Over100,
+}
+
+impl SizeBucket {
+    const ALL: [Self; 4] = [
+        Self::Under1,
+        Self::From1To10,
+        Self::From10To100,
+        Self::Over100,
+    ];
+
+    fn range(self) -> (u64, Option<u64>) {
+        const MB: u64 = 1024 * 1024;
+        match self {
+            Self::Under1 => (0, Some(MB)),
+            Self::From1To10 => (MB, Some(10 * MB)),
+            Self::From10To100 => (10 * MB, Some(100 * MB)),
+            Self::Over100 => (100 * MB, None),
+        }
+    }
+
+    fn key(self) -> Key {
+        match self {
+            Self::Under1 => Key::FileSizeUnder1Mb,
+            Self::From1To10 => Key::FileSize1To10Mb,
+            Self::From10To100 => Key::FileSize10To100Mb,
+            Self::Over100 => Key::FileSizeOver100Mb,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModifiedWithin {
+    Week,
+    Month,
+    Year,
+}
+
+impl ModifiedWithin {
+    const ALL: [Self; 3] = [Self::Week, Self::Month, Self::Year];
+
+    fn days(self) -> i64 {
+        match self {
+            Self::Week => 7,
+            Self::Month => 30,
+            Self::Year => 365,
+        }
+    }
+
+    fn key(self) -> Key {
+        match self {
+            Self::Week => Key::Last7Days,
+            Self::Month => Key::Last30Days,
+            Self::Year => Key::LastYear,
+        }
+    }
+}
+
+/// Filter bar state. Not persisted.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Filters {
+    formats: Vec<AssetFormat>,
+    fits_bed: bool,
+    file_size: Option<SizeBucket>,
+    modified: Option<ModifiedWithin>,
+    tags: Vec<String>,
+    tag_mode: TagMode,
+    untagged: bool,
+    thumb_failed: bool,
+}
+
+impl Filters {
+    /// How many filter groups are narrowing the view (for the toolbar badge).
+    fn active_count(&self) -> usize {
+        [
+            !self.formats.is_empty(),
+            self.fits_bed,
+            self.file_size.is_some(),
+            self.modified.is_some(),
+            !self.tags.is_empty(),
+            self.untagged || self.thumb_failed,
+        ]
+        .into_iter()
+        .filter(|on| *on)
+        .count()
+    }
+}
+
+/// Build volumes offered in the filter menu (X, Y, Z mm).
+const BED_PRESETS: [(&str, [f32; 3]); 5] = [
+    ("Bambu Lab A1 mini", [180.0, 180.0, 180.0]),
+    ("Bambu Lab A1 / P1 / X1", [256.0, 256.0, 256.0]),
+    ("Prusa MK4", [250.0, 210.0, 220.0]),
+    ("Creality Ender-3", [220.0, 220.0, 250.0]),
+    ("Voron 2.4 350", [350.0, 350.0, 340.0]),
+];
+const DEFAULT_BED: [f32; 3] = [256.0, 256.0, 256.0];
+
+/// "256x256x256" (also `×`, `*`, spaces) → X, Y, Z. All three must be positive.
+fn parse_bed(raw: &str) -> Option<[f32; 3]> {
+    let parts: Vec<f32> = raw
+        .split(['x', 'X', '×', '*'])
+        .map(|p| {
+            p.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+        })
+        .collect::<Option<_>>()?;
+    <[f32; 3]>::try_from(parts).ok()
+}
+
+/// Inverse of [`parse_bed`], as stored in the `bed` pref.
+fn bed_pref(bed: [f32; 3]) -> String {
+    bed.map(|v| v.to_string()).join("x")
+}
+
+/// "256×256×256" for display.
+fn bed_label(bed: [f32; 3]) -> String {
+    bed.map(|v| v.to_string()).join("×")
+}
+
+/// "a, b，c、d" → trimmed, non-empty tags.
+fn parse_tags(raw: &str) -> Vec<String> {
+    raw.split([',', '，', '、'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// A folder inside a library; the root node has an empty `path`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FolderNode {
+    name: String,
+    /// `/`-separated, relative to the library root.
+    path: String,
+    /// Assets in this folder and all its subfolders.
+    count: usize,
+    /// Sorted by name, case-insensitively.
+    children: Vec<FolderNode>,
+}
+
+/// Folder tree of a library from its assets' relative paths.
+fn build_folder_tree<'a>(rel_paths: impl IntoIterator<Item = &'a str>) -> FolderNode {
+    #[derive(Default)]
+    struct Building {
+        count: usize,
+        children: BTreeMap<String, Building>,
+    }
+    fn finish(name: String, path: String, node: Building) -> FolderNode {
+        let mut children: Vec<FolderNode> = node
+            .children
+            .into_iter()
+            .map(|(name, child)| {
+                let path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}/{name}")
+                };
+                finish(name, path, child)
+            })
+            .collect();
+        children.sort_by_key(|c| c.name.to_lowercase());
+        FolderNode {
+            name,
+            path,
+            count: node.count,
+            children,
+        }
+    }
+
+    let mut root = Building::default();
+    for rel in rel_paths {
+        root.count += 1;
+        let mut node = &mut root;
+        let mut parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+        parts.pop(); // the file itself
+        for part in parts {
+            node = node.children.entry(part.to_string()).or_default();
+            node.count += 1;
+        }
+    }
+    finish(String::new(), String::new(), root)
+}
+
+fn folder_exists(root: &FolderNode, path: &str) -> bool {
+    path.split('/')
+        .try_fold(root, |node, part| {
+            node.children.iter().find(|c| c.name == part)
+        })
+        .is_some()
+}
+
+/// Subfolder rows to show under `root`, depth-first, descending only into
+/// folders whose path is in `expanded`. Depth starts at 1.
+fn visible_folders(
+    root: &FolderNode,
+    expanded: impl Fn(&str) -> bool,
+) -> Vec<(usize, &FolderNode)> {
+    fn walk<'a>(
+        node: &'a FolderNode,
+        depth: usize,
+        expanded: &dyn Fn(&str) -> bool,
+        out: &mut Vec<(usize, &'a FolderNode)>,
+    ) {
+        for child in &node.children {
+            out.push((depth, child));
+            if expanded(&child.path) {
+                walk(child, depth + 1, expanded, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if expanded(&root.path) {
+        walk(root, 1, &expanded, &mut out);
+    }
+    out
+}
+
+/// Ids from `anchor` to `target` inclusive, in list order. Without a usable
+/// anchor, just `target`.
+fn range_ids(assets: &[Asset], anchor: Option<i64>, target: i64) -> Vec<i64> {
+    let find = |id: i64| assets.iter().position(|a| a.id == id);
+    let Some(to) = find(target) else {
+        return Vec::new();
+    };
+    let from = anchor.and_then(find).unwrap_or(to);
+    let (lo, hi) = (from.min(to), from.max(to));
+    assets[lo..=hi].iter().map(|a| a.id).collect()
+}
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiStatus {
     Idle,
@@ -175,11 +434,28 @@ pub struct Workspace {
     libraries: Vec<Library>,
     tags: Vec<(String, i64)>,
     assets: Vec<Asset>,
+    /// Primary selection: previewed, shown in the inspector, moved by arrows.
     selected: Option<i64>,
-    selected_library: Option<i64>,
-    selected_tag: Option<String>,
+    /// Every selected asset, in the order picked; includes `selected`.
+    selection: Vec<i64>,
+    /// Where Shift-click ranges start.
+    anchor: Option<i64>,
+    location: Location,
+    filters: Filters,
+    show_filters: bool,
+    /// Build volume for the "fits bed" filter, from the `bed` pref.
+    bed: [f32; 3],
+    /// Per library; rebuilt after scans and removals, not on every reload.
+    folder_trees: HashMap<i64, FolderNode>,
+    /// Expanded tree nodes as (library id, folder path); "" is the library itself.
+    expanded: HashSet<(i64, String)>,
+    duplicate_count: u32,
+    /// Assets sharing the primary selection's content hash, itself included.
+    selected_copies: u32,
     search: Entity<InputState>,
     tag_input: Entity<InputState>,
+    /// Inspector input that adds tags to every selected asset.
+    batch_tag_input: Entity<InputState>,
     search_text: String,
     search_generation: u64,
     sort: AssetSort,
@@ -224,6 +500,8 @@ impl Workspace {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::Search)));
         let tag_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::TagsHint)));
+        let batch_tag_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::AddTagsHint)));
 
         let card_size = read_pref("card_size")
             .and_then(|raw| raw.trim().parse::<f32>().ok())
@@ -260,6 +538,17 @@ impl Workspace {
                 }
             }),
         );
+        subs.push(cx.subscribe_in(
+            &batch_tag_input,
+            window,
+            |this, state, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let value = state.read(cx).value().to_string();
+                    this.add_tags_to_selection(&value, cx);
+                    state.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+            },
+        ));
         subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             apply_system_theme(Some(window), cx);
             if this.selected.is_some() {
@@ -274,10 +563,21 @@ impl Workspace {
             tags: Vec::new(),
             assets: Vec::new(),
             selected: None,
-            selected_library: None,
-            selected_tag: None,
+            selection: Vec::new(),
+            anchor: None,
+            location: Location::All,
+            filters: Filters::default(),
+            show_filters: false,
+            bed: read_pref("bed")
+                .and_then(|raw| parse_bed(&raw))
+                .unwrap_or(DEFAULT_BED),
+            folder_trees: HashMap::new(),
+            expanded: HashSet::new(),
+            duplicate_count: 0,
+            selected_copies: 0,
             search,
             tag_input,
+            batch_tag_input,
             search_text: String::new(),
             search_generation: 0,
             sort: read_pref("sort")
@@ -310,6 +610,7 @@ impl Workspace {
             _subscriptions: subs,
         };
         this.reload(cx);
+        this.reload_folders();
         this.start_watch_loop(cx);
         this.watch_libraries();
         this.scan_all(cx);
@@ -324,6 +625,9 @@ impl Workspace {
         self.tag_input.update(cx, |input, cx| {
             input.set_placeholder(i18n::t(Key::TagsHint), window, cx);
         });
+        self.batch_tag_input.update(cx, |input, cx| {
+            input.set_placeholder(i18n::t(Key::AddTagsHint), window, cx);
+        });
         cx.notify();
     }
 
@@ -332,20 +636,16 @@ impl Workspace {
             self.libraries = libs;
         }
         if let Ok(tags) = self.catalog.all_tags() {
+            // A tag deleted elsewhere (its last asset gone) stops filtering.
+            self.filters
+                .tags
+                .retain(|t| tags.iter().any(|(name, _)| name == t));
             self.tags = tags;
         }
-        let query = AssetQuery {
-            library_id: self.selected_library,
-            tag: self.selected_tag.clone(),
-            search: if self.search_text.trim().is_empty() {
-                None
-            } else {
-                Some(self.search_text.clone())
-            },
-            sort: self.sort,
-            ..Default::default()
-        };
-        match self.catalog.assets(&query) {
+        if let Ok(n) = self.catalog.duplicate_count() {
+            self.duplicate_count = n;
+        }
+        match self.catalog.assets(&self.query()) {
             Ok(assets) => self.assets = assets,
             Err(err) => eprintln!("catalog query failed: {err}"),
         }
@@ -354,6 +654,12 @@ impl Workspace {
                 self.selected = self.assets.first().map(|a| a.id);
             }
         }
+        let present: HashSet<i64> = self.assets.iter().map(|a| a.id).collect();
+        self.selection.retain(|id| present.contains(id));
+        if self.selection.is_empty() {
+            self.selection.extend(self.selected);
+        }
+        self.refresh_copies();
         let cache_fresh = match (&self.preview_mesh, self.selected_asset()) {
             (Some(cached), Some(asset)) => cached.matches(asset),
             _ => false,
@@ -362,6 +668,118 @@ impl Workspace {
             self.preview_mesh = None;
         }
         cx.notify();
+    }
+
+    fn query(&self) -> AssetQuery {
+        let (library_id, dir) = match &self.location {
+            Location::Library { id, dir } => (Some(*id), dir.clone()),
+            Location::All | Location::Duplicates => (None, None),
+        };
+        let f = &self.filters;
+        AssetQuery {
+            library_id,
+            dir,
+            tags: f.tags.clone(),
+            tag_mode: f.tag_mode,
+            formats: f.formats.clone(),
+            fits_bed: f.fits_bed.then_some(self.bed),
+            file_size: f.file_size.map(SizeBucket::range),
+            modified_since_ns: f
+                .modified
+                .map(|m| now_ns() - m.days() * 86_400 * 1_000_000_000),
+            untagged: f.untagged,
+            thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
+            duplicates_only: self.location == Location::Duplicates,
+            search: if self.search_text.trim().is_empty() {
+                None
+            } else {
+                Some(self.search_text.clone())
+            },
+            sort: self.sort,
+            ..Default::default()
+        }
+    }
+
+    /// Anything besides the sidebar location narrowing the list, so an empty
+    /// result means "no matches" rather than "empty folder".
+    fn is_filtered(&self) -> bool {
+        self.filters != Filters::default()
+            || !self.search_text.trim().is_empty()
+            || self.location == Location::Duplicates
+    }
+
+    /// Rebuild the sidebar folder trees. Separate from `reload` because that
+    /// runs every half second while thumbnails are generated.
+    fn reload_folders(&mut self) {
+        self.folder_trees = self
+            .libraries
+            .iter()
+            .filter_map(|lib| {
+                let paths = self.catalog.rel_paths(lib.id).ok()?;
+                Some((lib.id, build_folder_tree(paths.iter().map(String::as_str))))
+            })
+            .collect();
+        // Drop expansions of folders that no longer exist.
+        let trees = &self.folder_trees;
+        self.expanded.retain(|(lib, path)| {
+            trees
+                .get(lib)
+                .is_some_and(|tree| path.is_empty() || folder_exists(tree, path))
+        });
+        if let Location::Library { id, dir: Some(dir) } = &self.location {
+            if !trees.get(id).is_some_and(|tree| folder_exists(tree, dir)) {
+                self.location = Location::Library { id: *id, dir: None };
+            }
+        }
+    }
+
+    fn refresh_copies(&mut self) {
+        self.selected_copies = self
+            .selected_asset()
+            .and_then(|a| a.content_sha256.as_deref())
+            .and_then(|sha| self.catalog.copies(sha).ok())
+            .unwrap_or(0);
+    }
+
+    fn set_location(&mut self, location: Location, cx: &mut Context<Self>) {
+        self.location = location;
+        self.reload(cx);
+    }
+
+    fn toggle_expanded(&mut self, lib: i64, path: String, cx: &mut Context<Self>) {
+        let key = (lib, path);
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn update_filters(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Filters)) {
+        change(&mut self.filters);
+        self.reload(cx);
+    }
+
+    fn set_bed(&mut self, bed: [f32; 3], cx: &mut Context<Self>) {
+        self.bed = bed;
+        write_pref("bed", &bed_pref(bed));
+        self.filters.fits_bed = true;
+        self.reload(cx);
+    }
+
+    /// Sidebar tag click: plain click shows just that tag; ⌘/Ctrl-click adds
+    /// it to (or drops it from) the tag filter.
+    fn click_tag(&mut self, name: String, additive: bool, cx: &mut Context<Self>) {
+        if additive {
+            if let Some(i) = self.filters.tags.iter().position(|t| *t == name) {
+                self.filters.tags.remove(i);
+            } else {
+                self.filters.tags.push(name);
+            }
+        } else {
+            self.filters.tags = vec![name];
+            self.location = Location::All;
+        }
+        self.reload(cx);
     }
 
     /// Reload after typing pauses, so each keystroke doesn't re-query the catalog.
@@ -422,47 +840,94 @@ impl Workspace {
         cx.notify();
     }
 
-    fn regenerate_thumb(&mut self, id: i64, cx: &mut Context<Self>) {
-        let _ = self.catalog.set_thumb_state(id, ThumbState::Pending, None);
+    fn regenerate_thumbs(&mut self, ids: &[i64], cx: &mut Context<Self>) {
+        for &id in ids {
+            let _ = self.catalog.set_thumb_state(id, ThumbState::Pending, None);
+        }
         self.reload(cx);
         self.kick_thumbs(cx);
     }
 
-    /// Ask, then move the file to the system Trash and drop it from the index.
-    fn confirm_trash(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(asset) = self.assets.iter().find(|a| a.id == id).cloned() else {
-            return;
+    /// What a menu or shortcut acts on for `id`: the whole selection if `id`
+    /// is part of it, otherwise just `id`.
+    fn targets_for(&self, id: i64) -> Vec<i64> {
+        if self.selection.contains(&id) {
+            self.selection.clone()
+        } else {
+            vec![id]
+        }
+    }
+
+    /// Ask, then move the files to the system Trash and drop them from the index.
+    fn confirm_trash(&mut self, ids: &[i64], window: &mut Window, cx: &mut Context<Self>) {
+        let assets: Vec<Asset> = self
+            .assets
+            .iter()
+            .filter(|a| ids.contains(&a.id))
+            .cloned()
+            .collect();
+        let (title, detail) = match assets.as_slice() {
+            [] => return,
+            [one] => (i18n::trash_confirm(one.name()), i18n::t(Key::TrashDetail)),
+            many => (
+                i18n::trash_confirm_many(many.len()),
+                i18n::t(Key::TrashDetailMany),
+            ),
         };
         let this = cx.entity().downgrade();
         confirm_destructive(
             window,
             cx,
-            i18n::trash_confirm(asset.name()),
-            i18n::t(Key::TrashDetail),
+            title,
+            detail,
             i18n::t(Key::MoveToTrash),
             move |window, cx| {
-                let _ = this.update(cx, |this, cx| this.trash_asset(&asset, window, cx));
+                let assets = assets.clone();
+                let _ = this.update(cx, |this, cx| this.trash_assets(assets, window, cx));
             },
         );
     }
 
-    fn trash_asset(&mut self, asset: &Asset, window: &mut Window, cx: &mut Context<Self>) {
-        let id = asset.id;
-        let path = asset.abs_path();
+    /// Trash each file in turn; the ones that moved leave the index, and any
+    /// failures are reported together.
+    fn trash_assets(&mut self, assets: Vec<Asset>, window: &mut Window, cx: &mut Context<Self>) {
+        let index = assets
+            .iter()
+            .filter_map(|asset| self.assets.iter().position(|a| a.id == asset.id))
+            .min()
+            .unwrap_or(0);
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { move_to_trash(&path) })
+            let results: Vec<(i64, String, Result<(), String>)> = cx
+                .background_spawn(async move {
+                    assets
+                        .iter()
+                        .map(|a| {
+                            let result = move_to_trash(&a.abs_path()).map_err(|e| e.to_string());
+                            (a.id, a.name().to_string(), result)
+                        })
+                        .collect()
+                })
                 .await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => {
-                    let index = this.assets.iter().position(|a| a.id == id).unwrap_or(0);
-                    if let Err(err) = this.catalog.remove_asset(id) {
-                        eprintln!("remove asset failed: {err}");
+            this.update_in(cx, |this, window, cx| {
+                let mut failures = Vec::new();
+                let mut removed = false;
+                for (id, name, result) in results {
+                    match result {
+                        Ok(()) => {
+                            removed = true;
+                            if let Err(err) = this.catalog.remove_asset(id) {
+                                eprintln!("remove asset failed: {err}");
+                            }
+                        }
+                        Err(err) => failures.push(format!("{name}: {err}")),
                     }
+                }
+                if removed {
+                    this.reload_folders();
                     this.reload_after_removal(index, window, cx);
                 }
-                Err(err) => {
-                    let detail = err.to_string();
+                if !failures.is_empty() {
+                    let detail = failures.join("\n");
                     window.open_alert_dialog(cx, move |alert, _, _| {
                         alert
                             .title(i18n::t(Key::TrashFailed))
@@ -502,9 +967,11 @@ impl Workspace {
         if let Some(watch) = &self.watch {
             watch.unwatch(lib.root_path.clone());
         }
-        if self.selected_library == Some(lib.id) {
-            self.selected_library = None;
+        if matches!(self.location, Location::Library { id, .. } if id == lib.id) {
+            self.location = Location::All;
         }
+        self.libraries.retain(|l| l.id != lib.id);
+        self.reload_folders();
         let index = self.selected_index().unwrap_or(0);
         self.reload_after_removal(index, window, cx);
     }
@@ -527,6 +994,8 @@ impl Workspace {
             Some(next) => self.select(next, window, cx),
             None => {
                 self.selected = None;
+                self.selection.clear();
+                self.anchor = None;
                 self.preview_mesh = None;
                 if let Some(old) = self.preview_image.take() {
                     cx.drop_image(old, None);
@@ -601,6 +1070,7 @@ impl Workspace {
                 this.scanning = false;
                 this.status = UiStatus::Idle;
                 this.reload(cx);
+                this.reload_folders();
                 this.watch_libraries();
                 this.kick_thumbs(cx);
             })
@@ -726,8 +1196,64 @@ impl Workspace {
         .detach();
     }
 
+    /// Select only `id`.
     fn select(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection = vec![id];
+        self.anchor = Some(id);
+        self.focus_asset(id, window, cx);
+    }
+
+    /// ⌘/Ctrl-click: add `id` to the selection, or take it out.
+    fn toggle_select(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.anchor = Some(id);
+        if let Some(i) = self.selection.iter().position(|s| *s == id) {
+            self.selection.remove(i);
+            if self.selected == Some(id) {
+                match self.selection.last().copied() {
+                    Some(next) => self.focus_asset(next, window, cx),
+                    None => self.clear_selection(cx),
+                }
+            } else {
+                cx.notify();
+            }
+        } else {
+            self.selection.push(id);
+            self.focus_asset(id, window, cx);
+        }
+    }
+
+    /// Shift-click: select everything from the anchor to `id`.
+    fn extend_select(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection = range_ids(&self.assets, self.anchor, id);
+        if self.anchor.is_none() {
+            self.anchor = Some(id);
+        }
+        self.focus_asset(id, window, cx);
+    }
+
+    fn select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection = self.assets.iter().map(|a| a.id).collect();
+        match self.selected.or_else(|| self.assets.first().map(|a| a.id)) {
+            Some(id) if self.selected != Some(id) => self.focus_asset(id, window, cx),
+            _ => cx.notify(),
+        }
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.selection.clear();
+        self.preview_mesh = None;
+        if let Some(old) = self.preview_image.take() {
+            cx.drop_image(old, None);
+        }
+        cx.notify();
+    }
+
+    /// Make `id` the primary selection: preview it and load its tags into the
+    /// inspector. Leaves `selection` alone.
+    fn focus_asset(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(id);
+        self.refresh_copies();
         if self.preview_mesh.as_ref().is_some_and(|m| m.asset_id != id) {
             self.preview_mesh = None;
         }
@@ -839,12 +1365,25 @@ impl Workspace {
         let Some(id) = self.selected else {
             return;
         };
-        let tags: Vec<String> = raw
-            .split(|c| c == ',' || c == '，' || c == '、')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let _ = self.catalog.set_tags(id, &tags);
+        let _ = self.catalog.set_tags(id, &parse_tags(raw));
+        self.reload(cx);
+    }
+
+    fn add_tags_to_selection(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let tags = parse_tags(raw);
+        if tags.is_empty() || self.selection.is_empty() {
+            return;
+        }
+        if let Err(err) = self.catalog.add_tags(&self.selection, &tags) {
+            eprintln!("add tags failed: {err}");
+        }
+        self.reload(cx);
+    }
+
+    fn remove_tag_from_selection(&mut self, tag: &str, cx: &mut Context<Self>) {
+        if let Err(err) = self.catalog.remove_tag(&self.selection, tag) {
+            eprintln!("remove tag failed: {err}");
+        }
         self.reload(cx);
     }
 
@@ -972,9 +1511,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &AddFolder, window, cx| this.add_folder(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| this.open_selected(cx)))
             .on_action(cx.listener(|this, _: &TrashSelected, window, cx| {
-                if let Some(id) = this.selected {
-                    this.confirm_trash(id, window, cx);
-                }
+                let ids = this.selection.clone();
+                this.confirm_trash(&ids, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 window.focus(&this.search.read(cx).focus_handle(cx), cx);
@@ -993,6 +1531,7 @@ impl Render for Workspace {
             }))
             .child(title_bar(cx))
             .child(toolbar(self, cx))
+            .when(self.show_filters, |el| el.child(filter_bar(self, cx)))
             .child(
                 // Stretching row, not `h_flex()`: that helper centers on Y and
                 // collapses children without an explicit height to 0px, which
@@ -1079,6 +1618,23 @@ fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                     })
                 }),
         )
+        .child({
+            let active = this.filters.active_count();
+            Button::new("filter")
+                .ghost()
+                .icon(Lucide::ListFilter)
+                .label(if active > 0 {
+                    format!("{} · {active}", i18n::t(Key::Filter))
+                } else {
+                    i18n::t(Key::Filter).to_string()
+                })
+                .selected(this.show_filters || active > 0)
+                .toggled(this.show_filters)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_filters = !this.show_filters;
+                    cx.notify();
+                }))
+        })
         .child(div().flex_1())
         .child(activity(this, &theme))
         .child(
@@ -1130,6 +1686,280 @@ fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .label(i18n::t(Key::AddFolder))
                 .icon(IconName::Plus)
                 .on_click(cx.listener(|this, _, window, cx| this.add_folder(window, cx))),
+        )
+}
+
+/// Dropdowns under the toolbar; each button's label shows its current value.
+fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let workspace = cx.entity().downgrade();
+    let f = this.filters.clone();
+    let bed = this.bed;
+    let tags: Vec<String> = this.tags.iter().map(|(name, _)| name.clone()).collect();
+
+    // Menu item that applies `change` to the filters.
+    fn filter_item(
+        label: impl Into<SharedString>,
+        checked: bool,
+        workspace: &WeakEntity<Workspace>,
+        change: impl Fn(&mut Filters) + 'static,
+    ) -> PopupMenuItem {
+        let workspace = workspace.clone();
+        PopupMenuItem::new(label)
+            .checked(checked)
+            .on_click(move |_, _, cx| {
+                let _ = workspace.update(cx, |this, cx| this.update_filters(cx, &change));
+            })
+    }
+    fn titled(key: Key, value: Option<String>) -> String {
+        match value {
+            Some(value) => format!("{}: {value}", i18n::t(key)),
+            None => i18n::t(key).to_string(),
+        }
+    }
+    let dropdown = |id: &'static str, label: String, active: bool| {
+        Button::new(id)
+            .small()
+            .when(active, |b| b.primary())
+            .when(!active, |b| b.outline())
+            .label(label)
+            .dropdown_caret(true)
+    };
+
+    let formats_label = (!f.formats.is_empty()).then(|| {
+        f.formats
+            .iter()
+            .map(|fmt| fmt.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    let tag_joiner = if f.tag_mode == TagMode::All {
+        " + "
+    } else {
+        " / "
+    };
+    let tags_label = (!f.tags.is_empty()).then(|| f.tags.join(tag_joiner));
+    let more_label = {
+        let parts: Vec<&str> = [
+            f.untagged.then(|| i18n::t(Key::Untagged)),
+            f.thumb_failed.then(|| i18n::t(Key::ThumbFailed)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    };
+
+    h_flex()
+        .w_full()
+        .px_3()
+        .py_1p5()
+        .gap_1p5()
+        .items_center()
+        .flex_wrap()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            dropdown(
+                "filter-format",
+                titled(Key::Format, formats_label),
+                !f.formats.is_empty(),
+            )
+            .dropdown_menu({
+                let (workspace, formats) = (workspace.clone(), f.formats.clone());
+                move |menu, _, _| {
+                    [AssetFormat::ThreeMf, AssetFormat::Stl, AssetFormat::Obj]
+                        .into_iter()
+                        .fold(menu, |menu, fmt| {
+                            menu.item(filter_item(
+                                fmt.label(),
+                                formats.contains(&fmt),
+                                &workspace,
+                                move |f| match f.formats.iter().position(|x| *x == fmt) {
+                                    Some(i) => {
+                                        f.formats.remove(i);
+                                    }
+                                    None => f.formats.push(fmt),
+                                },
+                            ))
+                        })
+                }
+            }),
+        )
+        .child(
+            dropdown(
+                "filter-bed",
+                if f.fits_bed {
+                    i18n::fits_bed(&bed_label(bed))
+                } else {
+                    i18n::t(Key::Size).to_string()
+                },
+                f.fits_bed,
+            )
+            .dropdown_menu({
+                let (workspace, fits) = (workspace.clone(), f.fits_bed);
+                move |menu, _, _| {
+                    let menu = menu
+                        .item(filter_item(i18n::t(Key::AnySize), !fits, &workspace, |f| {
+                            f.fits_bed = false
+                        }))
+                        .item(filter_item(
+                            i18n::fits_bed(&bed_label(bed)),
+                            fits,
+                            &workspace,
+                            |f| f.fits_bed = true,
+                        ))
+                        .separator()
+                        .label(i18n::t(Key::PrinterBed));
+                    BED_PRESETS.iter().fold(menu, |menu, (name, preset)| {
+                        let (workspace, preset) = (workspace.clone(), *preset);
+                        menu.item(
+                            PopupMenuItem::new(format!("{name} ({})", bed_label(preset)))
+                                .checked(preset == bed)
+                                .on_click(move |_, _, cx| {
+                                    let _ =
+                                        workspace.update(cx, |this, cx| this.set_bed(preset, cx));
+                                }),
+                        )
+                    })
+                }
+            }),
+        )
+        .child(
+            dropdown(
+                "filter-file-size",
+                titled(
+                    Key::FileSize,
+                    f.file_size.map(|b| i18n::t(b.key()).to_string()),
+                ),
+                f.file_size.is_some(),
+            )
+            .dropdown_menu({
+                let (workspace, current) = (workspace.clone(), f.file_size);
+                move |menu, _, _| {
+                    let menu = menu.item(filter_item(
+                        i18n::t(Key::AnyFileSize),
+                        current.is_none(),
+                        &workspace,
+                        |f| f.file_size = None,
+                    ));
+                    SizeBucket::ALL.into_iter().fold(menu, |menu, bucket| {
+                        menu.item(filter_item(
+                            i18n::t(bucket.key()),
+                            current == Some(bucket),
+                            &workspace,
+                            move |f| f.file_size = Some(bucket),
+                        ))
+                    })
+                }
+            }),
+        )
+        .child(
+            dropdown(
+                "filter-modified",
+                titled(
+                    Key::Modified,
+                    f.modified.map(|m| i18n::t(m.key()).to_string()),
+                ),
+                f.modified.is_some(),
+            )
+            .dropdown_menu({
+                let (workspace, current) = (workspace.clone(), f.modified);
+                move |menu, _, _| {
+                    let menu = menu.item(filter_item(
+                        i18n::t(Key::AnyTime),
+                        current.is_none(),
+                        &workspace,
+                        |f| f.modified = None,
+                    ));
+                    ModifiedWithin::ALL.into_iter().fold(menu, |menu, within| {
+                        menu.item(filter_item(
+                            i18n::t(within.key()),
+                            current == Some(within),
+                            &workspace,
+                            move |f| f.modified = Some(within),
+                        ))
+                    })
+                }
+            }),
+        )
+        .child(
+            dropdown(
+                "filter-tags",
+                titled(Key::Tags, tags_label),
+                !f.tags.is_empty(),
+            )
+            .dropdown_menu({
+                let (workspace, selected, mode) = (workspace.clone(), f.tags.clone(), f.tag_mode);
+                move |menu, _, _| {
+                    let menu = menu
+                        .item(filter_item(
+                            i18n::t(Key::TagMatchAll),
+                            mode == TagMode::All,
+                            &workspace,
+                            |f| f.tag_mode = TagMode::All,
+                        ))
+                        .item(filter_item(
+                            i18n::t(Key::TagMatchAny),
+                            mode == TagMode::Any,
+                            &workspace,
+                            |f| f.tag_mode = TagMode::Any,
+                        ))
+                        .separator();
+                    if tags.is_empty() {
+                        return menu.label(i18n::t(Key::NoTagsYet));
+                    }
+                    tags.iter().fold(menu, |menu, name| {
+                        let tag = name.clone();
+                        menu.item(filter_item(
+                            name.clone(),
+                            selected.contains(name),
+                            &workspace,
+                            move |f| match f.tags.iter().position(|t| *t == tag) {
+                                Some(i) => {
+                                    f.tags.remove(i);
+                                }
+                                None => f.tags.push(tag.clone()),
+                            },
+                        ))
+                    })
+                }
+            }),
+        )
+        .child(
+            dropdown(
+                "filter-more",
+                titled(Key::MoreFilters, more_label),
+                f.untagged || f.thumb_failed,
+            )
+            .dropdown_menu({
+                let (workspace, untagged, failed) = (workspace.clone(), f.untagged, f.thumb_failed);
+                move |menu, _, _| {
+                    menu.item(filter_item(
+                        i18n::t(Key::Untagged),
+                        untagged,
+                        &workspace,
+                        |f| f.untagged = !f.untagged,
+                    ))
+                    .item(filter_item(
+                        i18n::t(Key::ThumbFailed),
+                        failed,
+                        &workspace,
+                        |f| f.thumb_failed = !f.thumb_failed,
+                    ))
+                }
+            }),
+        )
+        .child(div().flex_1())
+        .child(
+            Button::new("filter-clear")
+                .ghost()
+                .small()
+                .label(i18n::t(Key::ClearFilters))
+                .disabled(f == Filters::default())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_filters(cx, |f| *f = Filters::default())
+                })),
         )
 }
 
@@ -1191,7 +2021,6 @@ fn sort_is_ascending(sort: AssetSort) -> bool {
 
 fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let workspace = cx.entity().downgrade();
     v_flex()
         .id("sidebar")
         .w(px(SIDEBAR_WIDTH))
@@ -1209,59 +2038,38 @@ fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             Lucide::Boxes.into(),
             i18n::t(Key::AllAssets).to_string(),
             None,
-            this.selected_library.is_none() && this.selected_tag.is_none(),
+            this.location == Location::All && this.filters.tags.is_empty(),
             false,
             cx.listener(|this, _, _, cx| {
-                this.selected_library = None;
-                this.selected_tag = None;
+                this.location = Location::All;
+                this.filters.tags.clear();
                 this.reload(cx);
             }),
             &theme,
         ))
-        .children(this.libraries.iter().map(|lib| {
-            let id = lib.id;
-            let label = library_label(lib).to_string();
-            let online = lib.root_path.exists();
-            let selected = this.selected_library == Some(id);
-            nav_item(
-                format!("nav-lib-{id}"),
-                if selected {
-                    IconName::FolderOpen.into()
-                } else {
-                    IconName::Folder.into()
-                },
-                label,
-                (!online).then(|| i18n::t(Key::Offline).to_string()),
-                selected,
-                !online,
-                cx.listener(move |this, _, _, cx| {
-                    this.selected_library = Some(id);
-                    this.selected_tag = None;
-                    this.reload(cx);
-                }),
+        .when(this.duplicate_count > 0, |el| {
+            el.child(nav_item(
+                "nav-duplicates",
+                Lucide::Files.into(),
+                i18n::t(Key::Duplicates).to_string(),
+                Some(this.duplicate_count.to_string()),
+                this.location == Location::Duplicates,
+                false,
+                cx.listener(|this, _, _, cx| this.set_location(Location::Duplicates, cx)),
                 &theme,
-            )
-            .context_menu({
-                let workspace = workspace.clone();
-                move |menu, _, _| {
-                    let workspace = workspace.clone();
-                    menu.item(
-                        PopupMenuItem::new(i18n::t(Key::RemoveFolderEllipsis))
-                            .icon(Icon::new(Lucide::FolderMinus))
-                            .on_click(move |_, window, cx| {
-                                let _ = workspace.update(cx, |this, cx| {
-                                    this.confirm_remove_library(id, window, cx)
-                                });
-                            }),
-                    )
-                }
-            })
-        }))
+            ))
+        })
+        .children(
+            this.libraries
+                .iter()
+                .flat_map(|lib| library_rows(this, lib, cx))
+                .collect::<Vec<_>>(),
+        )
         .when(!this.tags.is_empty(), |el| {
             el.child(sidebar_section(i18n::t(Key::Tags), &theme))
         })
         .children(this.tags.iter().cloned().map(|(name, count)| {
-            let selected = this.selected_tag.as_deref() == Some(name.as_str());
+            let selected = this.filters.tags.contains(&name);
             let tag_name = name.clone();
             nav_item(
                 format!("nav-tag-{name}"),
@@ -1270,14 +2078,150 @@ fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 Some(count.to_string()),
                 selected,
                 false,
-                cx.listener(move |this, _, _, cx| {
-                    this.selected_tag = Some(tag_name.clone());
-                    this.selected_library = None;
-                    this.reload(cx);
+                cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    this.click_tag(tag_name.clone(), event.modifiers().secondary(), cx);
                 }),
                 &theme,
             )
         }))
+}
+
+/// A library row and, when expanded, its subfolder rows.
+fn library_rows(this: &Workspace, lib: &Library, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
+    let theme = cx.theme().clone();
+    let workspace = cx.entity().downgrade();
+    let id = lib.id;
+    let online = lib.root_path.exists();
+    let tree = this.folder_trees.get(&id);
+    let is_expanded = |path: &str| this.expanded.contains(&(id, path.to_string()));
+    let selected_dir = match &this.location {
+        Location::Library { id: lib_id, dir } if *lib_id == id => Some(dir.as_deref()),
+        _ => None,
+    };
+
+    let root_selected = selected_dir == Some(None);
+    let root_item = nav_item(
+        format!("nav-lib-{id}"),
+        if root_selected {
+            IconName::FolderOpen.into()
+        } else {
+            IconName::Folder.into()
+        },
+        library_label(lib).to_string(),
+        if online {
+            tree.map(|t| t.count.to_string())
+        } else {
+            Some(i18n::t(Key::Offline).to_string())
+        },
+        root_selected,
+        !online,
+        cx.listener(move |this, _, _, cx| {
+            this.set_location(Location::Library { id, dir: None }, cx)
+        }),
+        &theme,
+    )
+    .ml_0p5()
+    .context_menu(move |menu, _, _| {
+        let workspace = workspace.clone();
+        menu.item(
+            PopupMenuItem::new(i18n::t(Key::RemoveFolderEllipsis))
+                .icon(Icon::new(Lucide::FolderMinus))
+                .on_click(move |_, window, cx| {
+                    let _ = workspace
+                        .update(cx, |this, cx| this.confirm_remove_library(id, window, cx));
+                }),
+        )
+    });
+
+    let has_children = tree.is_some_and(|t| !t.children.is_empty());
+    let mut rows = vec![tree_row(
+        format!("lib-{id}"),
+        0,
+        has_children.then(|| is_expanded("")),
+        cx.listener(move |this, _, _, cx| this.toggle_expanded(id, String::new(), cx)),
+        root_item,
+        &theme,
+    )];
+    let Some(tree) = tree else {
+        return rows;
+    };
+    for (depth, folder) in visible_folders(tree, is_expanded) {
+        let path = folder.path.clone();
+        let selected = selected_dir == Some(Some(path.as_str()));
+        let item = nav_item(
+            format!("nav-dir-{id}-{path}"),
+            if selected {
+                IconName::FolderOpen.into()
+            } else {
+                IconName::Folder.into()
+            },
+            folder.name.clone(),
+            Some(folder.count.to_string()),
+            selected,
+            !online,
+            cx.listener({
+                let path = path.clone();
+                move |this, _, _, cx| {
+                    this.set_location(
+                        Location::Library {
+                            id,
+                            dir: Some(path.clone()),
+                        },
+                        cx,
+                    )
+                }
+            }),
+            &theme,
+        )
+        .ml_0p5();
+        let toggle_path = path.clone();
+        rows.push(tree_row(
+            format!("dir-{id}-{path}"),
+            depth,
+            (!folder.children.is_empty()).then(|| is_expanded(&path)),
+            cx.listener(move |this, _, _, cx| this.toggle_expanded(id, toggle_path.clone(), cx)),
+            item,
+            &theme,
+        ));
+    }
+    rows
+}
+
+/// Indents a sidebar item and puts a disclosure chevron in front of it.
+/// `expanded` is `None` for folders with nothing to expand.
+fn tree_row(
+    id: String,
+    depth: usize,
+    expanded: Option<bool>,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    item: impl IntoElement,
+    theme: &gpui_kit::component::Theme,
+) -> AnyElement {
+    h_flex()
+        .pl(px(8.0 + depth as f32 * 12.0))
+        .items_center()
+        .child(
+            div()
+                .id(ElementId::Name(format!("toggle-{id}").into()))
+                .size(px(16.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .when_some(expanded, |el, open| {
+                    el.cursor_pointer().on_click(on_toggle).child(
+                        Icon::new(if open {
+                            Lucide::ChevronDown
+                        } else {
+                            Lucide::ChevronRight
+                        })
+                        .xsmall(),
+                    )
+                }),
+        )
+        .child(div().flex_1().min_w_0().child(item))
+        .into_any_element()
 }
 
 /// Confirm a destructive action. Cancel is the default: Enter and Escape
@@ -1413,6 +2357,7 @@ fn asset_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement
         .on_action(cx.listener(|this, _: &SelectDown, window, cx| {
             this.move_selection(Step::Down, window, cx)
         }))
+        .on_action(cx.listener(|this, _: &SelectAll, window, cx| this.select_all(window, cx)))
         .flex_1()
         .h_full()
         .min_w_0()
@@ -1431,7 +2376,11 @@ fn asset_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(Lucide::FolderSearch).large())
-                .child(i18n::t(Key::EmptyFolder))
+                .child(i18n::t(if this.is_filtered() {
+                    Key::NoMatches
+                } else {
+                    Key::EmptyFolder
+                }))
                 .into_any_element()
         } else {
             match this.view_mode {
@@ -1445,7 +2394,7 @@ fn grid(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let cols = this.grid_cols.max(1);
     let rows = this.assets.len().div_ceil(cols);
     let assets = this.assets.clone();
-    let selected = this.selected;
+    let selection: Arc<HashSet<i64>> = Arc::new(this.selection.iter().copied().collect());
     let size = this.grid_card_width;
     let workspace = cx.entity().downgrade();
     uniform_list("asset-grid", rows, move |range, _window, cx| {
@@ -1462,7 +2411,7 @@ fn grid(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                         assets.get(row * cols + col).map(|asset| {
                             card(
                                 asset,
-                                selected == Some(asset.id),
+                                selection.contains(&asset.id),
                                 size,
                                 workspace.clone(),
                                 cx,
@@ -1516,8 +2465,9 @@ fn empty_state(cx: &mut Context<Workspace>) -> impl IntoElement {
         )
 }
 
-/// Click selects (and focuses the asset view for arrow keys), double-click
-/// opens, right-click selects and shows the asset menu.
+/// Click selects (and focuses the asset view for arrow keys); ⌘/Ctrl-click
+/// toggles, Shift-click selects a range; double-click opens. Right-click on
+/// a selected asset keeps the selection, otherwise selects just that one.
 fn asset_interactions(
     el: Stateful<Div>,
     asset: &Asset,
@@ -1529,33 +2479,53 @@ fn asset_interactions(
     let on_click = workspace.clone();
     el.on_mouse_down(MouseButton::Right, move |_, window, cx| {
         let _ = on_right.update(cx, |this, cx| {
-            if this.selected != Some(id) {
+            if !this.selection.contains(&id) {
                 this.select(id, window, cx);
             }
         });
     })
     .on_click(move |event: &ClickEvent, window, cx| {
         let dbl = event.click_count() > 1;
+        let modifiers = event.modifiers();
         let _ = on_click.update(cx, |this, cx| {
             window.focus(&this.asset_focus, cx);
             if dbl {
                 this.selected = Some(id);
                 this.open_selected(cx);
+            } else if modifiers.shift {
+                this.extend_select(id, window, cx);
+            } else if modifiers.secondary() {
+                this.toggle_select(id, window, cx);
             } else {
                 this.select(id, window, cx);
             }
         });
     })
-    .context_menu(move |menu, _, _| asset_menu(menu, id, path.clone(), workspace.clone()))
+    .context_menu(move |menu, _, cx| {
+        let targets = workspace
+            .upgrade()
+            .map(|w| w.read(cx).targets_for(id))
+            .unwrap_or_else(|| vec![id]);
+        asset_menu(menu, targets, path.clone(), workspace.clone())
+    })
 }
 
+/// Open / reveal / copy act on the clicked asset; thumbnail and trash items
+/// act on every target (the selection, when the click was inside it).
 fn asset_menu(
     menu: PopupMenu,
-    id: i64,
+    targets: Vec<i64>,
     path: std::path::PathBuf,
     workspace: WeakEntity<Workspace>,
 ) -> PopupMenu {
     let (open, reveal, copy) = (path.clone(), path.clone(), path);
+    let many = targets.len() > 1;
+    let trash_label = if many {
+        i18n::move_n_to_trash(targets.len())
+    } else {
+        i18n::t(Key::MoveToTrashEllipsis).to_string()
+    };
+    let regenerate_targets = targets.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(Key::Open))
             .icon(IconName::ExternalLink)
@@ -1578,18 +2548,24 @@ fn asset_menu(
     .separator()
     .item({
         let workspace = workspace.clone();
-        PopupMenuItem::new(i18n::t(Key::RegenerateThumb))
-            .icon(IconName::RotateCw)
-            .on_click(move |_, _, cx| {
-                let _ = workspace.update(cx, |this, cx| this.regenerate_thumb(id, cx));
-            })
+        PopupMenuItem::new(i18n::t(if many {
+            Key::RegenerateThumbs
+        } else {
+            Key::RegenerateThumb
+        }))
+        .icon(IconName::RotateCw)
+        .on_click(move |_, _, cx| {
+            let _ = workspace.update(cx, |this, cx| {
+                this.regenerate_thumbs(&regenerate_targets, cx)
+            });
+        })
     })
     .separator()
     .item(
-        PopupMenuItem::new(i18n::t(Key::MoveToTrashEllipsis))
+        PopupMenuItem::new(trash_label)
             .icon(Icon::new(Lucide::Trash))
             .on_click(move |_, window, cx| {
-                let _ = workspace.update(cx, |this, cx| this.confirm_trash(id, window, cx));
+                let _ = workspace.update(cx, |this, cx| this.confirm_trash(&targets, window, cx));
             }),
     )
 }
@@ -1716,7 +2692,7 @@ fn thumb_content(asset: &Asset, theme: &gpui_kit::component::Theme) -> AnyElemen
 fn list(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let theme = cx.theme().clone();
     let assets = this.assets.clone();
-    let selected = this.selected;
+    let selection: HashSet<i64> = this.selection.iter().copied().collect();
     let workspace = cx.entity().downgrade();
     let sort = this.sort;
     v_flex()
@@ -1774,7 +2750,9 @@ fn list(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             uniform_list("asset-list", assets.len(), move |range, _window, cx| {
                 range
                     .filter_map(|i| assets.get(i))
-                    .map(|asset| list_row(asset, selected == Some(asset.id), workspace.clone(), cx))
+                    .map(|asset| {
+                        list_row(asset, selection.contains(&asset.id), workspace.clone(), cx)
+                    })
                     .collect()
             })
             .track_scroll(&this.asset_scroll)
@@ -1918,8 +2896,14 @@ fn inspector(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement 
         .border_color(theme.border)
         .bg(theme.sidebar)
         .child(preview_pane(this, cx))
-        .when_some(this.selected_asset(), |el, asset| {
-            el.child(asset_details(this, asset, cx))
+        .map(|el| {
+            if this.selection.len() > 1 {
+                el.child(batch_details(this, cx))
+            } else if let Some(asset) = this.selected_asset() {
+                el.child(asset_details(this, asset, cx))
+            } else {
+                el
+            }
         })
 }
 
@@ -2063,7 +3047,14 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                     i18n::t(Key::Modified),
                     format_date(asset.mtime_ns),
                     &theme,
-                )),
+                ))
+                .when(this.selected_copies > 1, |el| {
+                    el.child(meta_row(
+                        i18n::t(Key::Copies),
+                        this.selected_copies.to_string(),
+                        &theme,
+                    ))
+                }),
         )
         .child(Input::new(&this.tag_input).prefix(Icon::new(Lucide::Tag).small()))
         .child(
@@ -2091,9 +3082,78 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                         .icon(Icon::new(Lucide::Trash))
                         .tooltip(i18n::t(Key::MoveToTrash))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.confirm_trash(id, window, cx)
+                            this.confirm_trash(&[id], window, cx)
                         }))
                 }),
+        )
+}
+
+/// Inspector body for a multi-selection: add tags to all, remove a tag from
+/// all, trash all.
+fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let selection: HashSet<i64> = this.selection.iter().copied().collect();
+    // Tags on any selected asset, with how many of them carry it.
+    let mut tag_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for asset in this.assets.iter().filter(|a| selection.contains(&a.id)) {
+        for tag in &asset.tags {
+            *tag_counts.entry(tag.as_str()).or_default() += 1;
+        }
+    }
+    let total = this.selection.len();
+    v_flex()
+        .flex_shrink_0()
+        .px_4()
+        .pb_4()
+        .gap_3()
+        .child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(i18n::selected_count(total)),
+        )
+        .child(Input::new(&this.batch_tag_input).prefix(Icon::new(Lucide::Tag).small()))
+        .when(!tag_counts.is_empty(), |el| {
+            el.child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(tag_counts.into_iter().map(|(tag, count)| {
+                        let name = tag.to_string();
+                        h_flex()
+                            .pl_2()
+                            .gap_0p5()
+                            .items_center()
+                            .rounded_md()
+                            .bg(theme.secondary)
+                            .text_xs()
+                            .child(if count == total {
+                                name.clone()
+                            } else {
+                                format!("{name} {count}/{total}")
+                            })
+                            .child(
+                                Button::new(SharedString::from(format!("untag-{name}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(Lucide::X))
+                                    .tooltip(i18n::t(Key::RemoveTag))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_tag_from_selection(&name, cx)
+                                    })),
+                            )
+                    })),
+            )
+        })
+        .child(
+            Button::new("trash-selection")
+                .outline()
+                .icon(Icon::new(Lucide::Trash))
+                .label(i18n::move_n_to_trash(total))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let ids = this.selection.clone();
+                    this.confirm_trash(&ids, window, cx)
+                })),
         )
 }
 
@@ -2241,6 +3301,130 @@ mod helper_tests {
             super::format_date(1_790_553_600 * 1_000_000_000),
             "2026-09-28"
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn folder_tree_counts_nested_assets_and_sorts_children() {
+        use super::build_folder_tree;
+        let tree = build_folder_tree([
+            "top.stl",
+            "b/one.stl",
+            "B2/x.stl",
+            "a/deep/two.stl",
+            "a/deep/three.stl",
+            "a/four.stl",
+        ]);
+        assert_eq!(tree.count, 6);
+        assert_eq!(tree.path, "");
+        let names: Vec<&str> = tree.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "B2"]);
+        let a = &tree.children[0];
+        assert_eq!((a.path.as_str(), a.count), ("a", 3));
+        assert_eq!(a.children[0].path, "a/deep");
+        assert_eq!(a.children[0].count, 2);
+        assert!(build_folder_tree(["only.stl"]).children.is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn visible_folders_follow_expansion() {
+        use super::{build_folder_tree, folder_exists, visible_folders};
+        let tree = build_folder_tree(["a/b/c/x.stl", "d/y.stl"]);
+        let rows = |open: &[&str]| {
+            visible_folders(&tree, |p| open.contains(&p))
+                .into_iter()
+                .map(|(depth, node)| (depth, node.path.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert!(rows(&[]).is_empty(), "collapsed library shows nothing");
+        assert_eq!(rows(&[""]), [(1, "a".into()), (1, "d".into())]);
+        assert_eq!(
+            rows(&["", "a", "a/b"]),
+            [
+                (1, "a".into()),
+                (2, "a/b".into()),
+                (3, "a/b/c".into()),
+                (1, "d".into())
+            ]
+        );
+        // A collapsed parent hides expanded descendants.
+        assert_eq!(rows(&["", "a/b"]), [(1, "a".into()), (1, "d".into())]);
+        assert!(folder_exists(&tree, "a/b/c"));
+        assert!(!folder_exists(&tree, "a/c"));
+    }
+
+    fn asset(id: i64) -> pam_core::catalog::Asset {
+        pam_core::catalog::Asset {
+            id,
+            library_id: 1,
+            root_path: "/lib".into(),
+            rel_path: format!("{id}.stl"),
+            format: pam_core::mesh::AssetFormat::Stl,
+            size_bytes: 0,
+            mtime_ns: 0,
+            content_sha256: None,
+            triangle_count: None,
+            bbox: None,
+            thumb_state: pam_core::catalog::ThumbState::Pending,
+            error: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn shift_click_selects_range_in_list_order() {
+        use super::range_ids;
+        let assets: Vec<_> = [10, 20, 30, 40].into_iter().map(asset).collect();
+        assert_eq!(range_ids(&assets, Some(20), 40), [20, 30, 40]);
+        assert_eq!(range_ids(&assets, Some(40), 20), [20, 30, 40]);
+        assert_eq!(range_ids(&assets, None, 30), [30]);
+        // Anchor filtered out of the list: fall back to the clicked asset.
+        assert_eq!(range_ids(&assets, Some(99), 30), [30]);
+        assert!(range_ids(&assets, Some(10), 99).is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn bed_pref_parses_and_roundtrips() {
+        use super::{bed_label, bed_pref, parse_bed, BED_PRESETS};
+        assert_eq!(parse_bed("256x256x256"), Some([256.0; 3]));
+        assert_eq!(parse_bed(" 250 × 210 × 220\n"), Some([250.0, 210.0, 220.0]));
+        assert_eq!(parse_bed("180*180*180"), Some([180.0; 3]));
+        assert_eq!(parse_bed("256x256"), None);
+        assert_eq!(parse_bed("256x0x256"), None);
+        assert_eq!(parse_bed("abc"), None);
+        for (_, bed) in BED_PRESETS {
+            assert_eq!(parse_bed(&bed_pref(bed)), Some(bed));
+        }
+        assert_eq!(bed_label([250.0, 210.0, 220.0]), "250×210×220");
+    }
+
+    #[::core::prelude::v1::test]
+    fn tags_split_on_ascii_and_cjk_commas() {
+        assert_eq!(
+            super::parse_tags(" a, b，c、 ,d "),
+            ["a", "b", "c", "d"].map(String::from)
+        );
+        assert!(super::parse_tags(" , ").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn filters_count_active_groups() {
+        use super::{Filters, SizeBucket};
+        assert_eq!(Filters::default().active_count(), 0);
+        let f = Filters {
+            fits_bed: true,
+            file_size: Some(SizeBucket::Over100),
+            untagged: true,
+            thumb_failed: true,
+            ..Default::default()
+        };
+        assert_eq!(f.active_count(), 3);
+        // Buckets tile the size range without gaps.
+        let ranges = SizeBucket::ALL.map(SizeBucket::range);
+        assert_eq!(ranges[0].0, 0);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, Some(pair[1].0));
+        }
+        assert_eq!(ranges[3].1, None);
     }
 
     #[::core::prelude::v1::test]

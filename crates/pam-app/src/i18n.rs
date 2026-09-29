@@ -92,6 +92,33 @@ pub enum Key {
     RemoveFolderDetail,
     Cancel,
     Ok,
+    Duplicates,
+    Filter,
+    ClearFilters,
+    AnySize,
+    PrinterBed,
+    FileSize,
+    AnyFileSize,
+    FileSizeUnder1Mb,
+    FileSize1To10Mb,
+    FileSize10To100Mb,
+    FileSizeOver100Mb,
+    AnyTime,
+    Last7Days,
+    Last30Days,
+    LastYear,
+    TagMatchAll,
+    TagMatchAny,
+    NoTagsYet,
+    MoreFilters,
+    Untagged,
+    ThumbFailed,
+    NoMatches,
+    Copies,
+    AddTagsHint,
+    RemoveTag,
+    RegenerateThumbs,
+    TrashDetailMany,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -145,6 +172,46 @@ pub fn trash_confirm(name: &str) -> String {
 
 pub fn remove_folder_confirm(name: &str) -> String {
     remove_folder_confirm_for(current(), name)
+}
+
+pub fn trash_confirm_many(n: usize) -> String {
+    trash_confirm_many_for(current(), n)
+}
+
+pub fn move_n_to_trash(n: usize) -> String {
+    match current() {
+        Language::Chinese => format!("將 {n} 個檔案移到垃圾桶…"),
+        Language::English => format!("Move {n} Files to Trash…"),
+    }
+}
+
+pub fn selected_count(n: usize) -> String {
+    selected_count_for(current(), n)
+}
+
+pub fn fits_bed(size: &str) -> String {
+    fits_bed_for(current(), size)
+}
+
+fn trash_confirm_many_for(language: Language, n: usize) -> String {
+    match language {
+        Language::Chinese => format!("要將 {n} 個檔案移到垃圾桶嗎？"),
+        Language::English => format!("Move {n} files to the Trash?"),
+    }
+}
+
+fn selected_count_for(language: Language, n: usize) -> String {
+    match language {
+        Language::Chinese => format!("已選取 {n} 個素材"),
+        Language::English => format!("{n} assets selected"),
+    }
+}
+
+fn fits_bed_for(language: Language, size: &str) -> String {
+    match language {
+        Language::Chinese => format!("放得進 {size} 平台"),
+        Language::English => format!("Fits {size} bed"),
+    }
 }
 
 fn trash_confirm_for(language: Language, name: &str) -> String {
@@ -334,6 +401,60 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::Cancel) => "Cancel",
         (Language::Chinese, Key::Ok) => "好",
         (Language::English, Key::Ok) => "OK",
+        (Language::Chinese, Key::Duplicates) => "重複檔案",
+        (Language::English, Key::Duplicates) => "Duplicates",
+        (Language::Chinese, Key::Filter) => "篩選",
+        (Language::English, Key::Filter) => "Filter",
+        (Language::Chinese, Key::ClearFilters) => "清除篩選",
+        (Language::English, Key::ClearFilters) => "Clear Filters",
+        (Language::Chinese, Key::AnySize) => "任何尺寸",
+        (Language::English, Key::AnySize) => "Any size",
+        (Language::Chinese, Key::PrinterBed) => "列印平台",
+        (Language::English, Key::PrinterBed) => "Printer bed",
+        (Language::Chinese, Key::FileSize) => "檔案大小",
+        (Language::English, Key::FileSize) => "File size",
+        (Language::Chinese, Key::AnyFileSize) => "任何大小",
+        (Language::English, Key::AnyFileSize) => "Any size",
+        (Language::Chinese, Key::FileSizeUnder1Mb) => "小於 1 MB",
+        (Language::English, Key::FileSizeUnder1Mb) => "Under 1 MB",
+        (Language::Chinese, Key::FileSize1To10Mb) => "1–10 MB",
+        (Language::English, Key::FileSize1To10Mb) => "1–10 MB",
+        (Language::Chinese, Key::FileSize10To100Mb) => "10–100 MB",
+        (Language::English, Key::FileSize10To100Mb) => "10–100 MB",
+        (Language::Chinese, Key::FileSizeOver100Mb) => "大於 100 MB",
+        (Language::English, Key::FileSizeOver100Mb) => "Over 100 MB",
+        (Language::Chinese, Key::AnyTime) => "任何時間",
+        (Language::English, Key::AnyTime) => "Any time",
+        (Language::Chinese, Key::Last7Days) => "最近 7 天",
+        (Language::English, Key::Last7Days) => "Last 7 days",
+        (Language::Chinese, Key::Last30Days) => "最近 30 天",
+        (Language::English, Key::Last30Days) => "Last 30 days",
+        (Language::Chinese, Key::LastYear) => "最近一年",
+        (Language::English, Key::LastYear) => "Last year",
+        (Language::Chinese, Key::TagMatchAll) => "符合全部標籤",
+        (Language::English, Key::TagMatchAll) => "Match all tags",
+        (Language::Chinese, Key::TagMatchAny) => "符合任一標籤",
+        (Language::English, Key::TagMatchAny) => "Match any tag",
+        (Language::Chinese, Key::NoTagsYet) => "尚無標籤",
+        (Language::English, Key::NoTagsYet) => "No tags yet",
+        (Language::Chinese, Key::MoreFilters) => "其他",
+        (Language::English, Key::MoreFilters) => "More",
+        (Language::Chinese, Key::Untagged) => "未加標籤",
+        (Language::English, Key::Untagged) => "Untagged",
+        (Language::Chinese, Key::ThumbFailed) => "縮圖失敗",
+        (Language::English, Key::ThumbFailed) => "Thumbnail failed",
+        (Language::Chinese, Key::NoMatches) => "沒有符合條件的素材",
+        (Language::English, Key::NoMatches) => "No matching assets",
+        (Language::Chinese, Key::Copies) => "副本",
+        (Language::English, Key::Copies) => "Copies",
+        (Language::Chinese, Key::AddTagsHint) => "加入標籤（逗號分隔，Enter 套用）",
+        (Language::English, Key::AddTagsHint) => "Add tags (comma-separated, press Enter)",
+        (Language::Chinese, Key::RemoveTag) => "移除標籤",
+        (Language::English, Key::RemoveTag) => "Remove tag",
+        (Language::Chinese, Key::RegenerateThumbs) => "重新產生縮圖",
+        (Language::English, Key::RegenerateThumbs) => "Regenerate Thumbnails",
+        (Language::Chinese, Key::TrashDetailMany) => "原始檔案會移到系統垃圾桶，可從垃圾桶復原。",
+        (Language::English, Key::TrashDetailMany) => "The original files will be moved to the system Trash, where you can restore them.",
     }
 }
 
@@ -404,6 +525,18 @@ mod tests {
             remove_folder_confirm_for(Language::English, "Models"),
             "Remove the folder “Models” from the library?"
         );
+        assert_eq!(
+            trash_confirm_many_for(Language::Chinese, 3),
+            "要將 3 個檔案移到垃圾桶嗎？"
+        );
+        assert_eq!(
+            selected_count_for(Language::English, 2),
+            "2 assets selected"
+        );
+        assert_eq!(
+            fits_bed_for(Language::Chinese, "256×256×256"),
+            "放得進 256×256×256 平台"
+        );
     }
 
     #[test]
@@ -463,6 +596,33 @@ mod tests {
             Key::RemoveFolderDetail,
             Key::Cancel,
             Key::Ok,
+            Key::Duplicates,
+            Key::Filter,
+            Key::ClearFilters,
+            Key::AnySize,
+            Key::PrinterBed,
+            Key::FileSize,
+            Key::AnyFileSize,
+            Key::FileSizeUnder1Mb,
+            Key::FileSize1To10Mb,
+            Key::FileSize10To100Mb,
+            Key::FileSizeOver100Mb,
+            Key::AnyTime,
+            Key::Last7Days,
+            Key::Last30Days,
+            Key::LastYear,
+            Key::TagMatchAll,
+            Key::TagMatchAny,
+            Key::NoTagsYet,
+            Key::MoreFilters,
+            Key::Untagged,
+            Key::ThumbFailed,
+            Key::NoMatches,
+            Key::Copies,
+            Key::AddTagsHint,
+            Key::RemoveTag,
+            Key::RegenerateThumbs,
+            Key::TrashDetailMany,
         ];
         for key in KEYS {
             assert!(
