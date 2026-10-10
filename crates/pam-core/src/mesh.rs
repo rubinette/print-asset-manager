@@ -210,7 +210,7 @@ impl Mesh {
             })
             .collect();
         let mut indices = Vec::new();
-        for tri in self.indices.chunks_exact(3) {
+        for tri in self.indices.as_chunks::<3>().0 {
             let [a, b, c] = [0, 1, 2].map(|k| cluster_of[tri[k] as usize]);
             if a != b && b != c && a != c {
                 indices.extend_from_slice(&[a, b, c]);
@@ -345,7 +345,7 @@ mod tests {
         }
         // Closed surface in, closed surface out: every edge still has a twin.
         let mut edges = std::collections::HashMap::<(u32, u32), i32>::new();
-        for t in slim.indices.chunks_exact(3) {
+        for t in slim.indices.as_chunks::<3>().0 {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 *edges.entry((a.min(b), a.max(b))).or_default() += 1;
             }

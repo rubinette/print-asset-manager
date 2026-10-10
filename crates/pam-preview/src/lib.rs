@@ -89,7 +89,7 @@ pub fn render_mesh(
         ]
     };
 
-    for tri in mesh.indices.chunks_exact(3) {
+    for tri in mesh.indices.as_chunks::<3>().0 {
         let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         let (wa, wb, wc) = (mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]);
         let e1 = sub(wb, wa);

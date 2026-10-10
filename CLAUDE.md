@@ -18,7 +18,7 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-MSRV is Rust 1.95, the oldest the locked GPUI crates compile with; CI's `msrv` job checks it, so bump it there and in `Cargo.toml` together. Linux builds need `libxkbcommon`, Vulkan/OpenGL drivers, and Wayland or X11 dev packages; macOS needs Xcode CLT (Metal).
+MSRV is Rust 1.95, the oldest the locked GPUI crates compile with; CI's `msrv` job checks it, so bump it there and in `Cargo.toml` together. Linux builds need `libxkbcommon`, `fontconfig`, Vulkan/OpenGL drivers, and Wayland or X11 dev packages; macOS needs Xcode CLT (Metal).
 
 ## Architecture
 

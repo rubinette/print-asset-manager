@@ -39,10 +39,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # GPUI links libxkbcommon; Wayland and Vulkan are loaded at runtime.
+      # GPUI links libxkbcommon, and its fontconfig bindings need fontconfig's
+      # pkg-config file to build. Wayland and Vulkan are loaded at runtime.
       - name: Install Linux libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -57,5 +58,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95"
+      # `cargo check` links nothing, but fontconfig's build script still runs.
+      - name: Install Linux libraries
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
