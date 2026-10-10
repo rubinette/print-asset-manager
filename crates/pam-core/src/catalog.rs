@@ -12,6 +12,10 @@ use crate::mesh::{AssetFormat, BBox};
 
 /// Files written per scan transaction.
 const SCAN_CHUNK: usize = 500;
+/// Most new files hashed to find where one vanished file went.
+const MOVE_HASH_CANDIDATES: usize = 8;
+/// Days a vanished file's tags wait in `detached_meta` for it to reappear.
+const DETACHED_KEEP_DAYS: i64 = 90;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -49,6 +53,15 @@ CREATE TABLE IF NOT EXISTS asset_tags (
   asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
   tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
   PRIMARY KEY (asset_id, tag_id)
+);
+
+-- User data (tags, ...) of files that left the index, keyed by content hash,
+-- as JSON. A file moved to another library gets it back once it is hashed
+-- there. Moves inside one library keep their row instead (`relink_moved`).
+CREATE TABLE IF NOT EXISTS detached_meta (
+  content_sha256 BLOB PRIMARY KEY,
+  data TEXT NOT NULL,
+  detached_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_thumb_state ON assets(thumb_state);
@@ -296,6 +309,8 @@ pub struct ScanStats {
     pub updated: u32,
     pub removed: u32,
     pub skipped: u32,
+    /// Files renamed or moved within the library; counted in no other field.
+    pub moved: u32,
 }
 
 pub struct Catalog {
@@ -307,16 +322,19 @@ impl Catalog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Self::init(Connection::open(path)?)
     }
 
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        conn.execute(
+            "DELETE FROM detached_meta WHERE detached_at < ?1",
+            params![now_secs() - DETACHED_KEEP_DAYS * 86_400],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -341,10 +359,13 @@ impl Catalog {
         })
     }
 
-    /// Forget a library and its assets. Files on disk are untouched.
+    /// Forget a library and its assets. Files on disk are untouched. Their
+    /// tags are kept aside, so adding the folder back (or a folder holding
+    /// the same files) restores them.
     pub fn remove_library(&self, id: i64) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        stash_user_data(&tx, "a.library_id = ?1", id)?;
         // assets_fts is contentless and not covered by the FK cascade.
         tx.execute(
             "DELETE FROM assets_fts WHERE rowid IN (SELECT id FROM assets WHERE library_id = ?1)",
@@ -398,6 +419,7 @@ impl Catalog {
         on_progress(0, total);
 
         let mut seen = HashSet::new();
+        let mut added = Vec::new();
         let mut done = 0u32;
         // Stat outside the lock, then write each chunk in one transaction so
         // queries from the UI thread can interleave between chunks.
@@ -417,8 +439,18 @@ impl Catalog {
             {
                 let mut conn = self.conn.lock().unwrap();
                 let tx = conn.transaction()?;
-                for (rel, format, size, mtime) in &entries {
-                    upsert_asset(&tx, library.id, rel, *format, *size, *mtime, &mut stats)?;
+                for (rel, format, size, mtime) in entries {
+                    if let Some(id) =
+                        upsert_asset(&tx, library.id, &rel, format, size, mtime, &mut stats)?
+                    {
+                        added.push(ScannedFile {
+                            id,
+                            rel,
+                            format: format.as_str().to_string(),
+                            size,
+                            mtime,
+                        });
+                    }
                 }
                 tx.commit()?;
             }
@@ -426,21 +458,48 @@ impl Catalog {
             on_progress(done, total);
         }
 
+        let gone: Vec<GoneFile> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, rel_path, format, size_bytes, mtime_ns, content_sha256
+                 FROM assets WHERE library_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![library.id], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    GoneFile {
+                        id: r.get(0)?,
+                        format: r.get(2)?,
+                        size: r.get(3)?,
+                        mtime: r.get(4)?,
+                        sha: r.get(5)?,
+                    },
+                ))
+            })?;
+            rows.filter_map(|r| r.ok())
+                .filter(|(rel, _)| !seen.contains(rel))
+                .map(|(_, gone)| gone)
+                .collect()
+        };
+        // Hashing reads files, so match moves before taking the lock.
+        let moves = plan_moves(&gone, &added, |file| {
+            file_sha256(&library.root_path.join(&file.rel)).ok()
+        });
+
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare("SELECT id, rel_path FROM assets WHERE library_id = ?1")?;
-        let stale: Vec<i64> = stmt
-            .query_map(params![library.id], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .filter(|(_, rel)| !seen.contains(rel))
-            .map(|(id, _)| id)
-            .collect();
-        drop(stmt);
-        for id in stale {
-            let _ = tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id]);
-            tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
+        let mut moved = HashSet::new();
+        for &(old_id, new_id) in &moves {
+            if relink_moved(&tx, old_id, new_id)? {
+                moved.insert(old_id);
+                stats.added -= 1;
+                stats.moved += 1;
+            }
+        }
+        for file in gone.iter().filter(|g| !moved.contains(&g.id)) {
+            stash_user_data(&tx, "a.id = ?1", file.id)?;
+            let _ = tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![file.id]);
+            tx.execute("DELETE FROM assets WHERE id = ?1", params![file.id])?;
             stats.removed += 1;
         }
         tx.commit()?;
@@ -729,13 +788,21 @@ impl Catalog {
     /// Hash `asset`'s file and store the hash, unless a scan has seen the file
     /// change since `asset` was read: the row then has a new size or mtime,
     /// and a hash of the old contents must not land on it.
+    ///
+    /// A file that left the index with tags (moved out of another library)
+    /// gets them back here, if this asset has none of its own yet.
     pub fn hash_asset(&self, asset: &Asset) -> Result<Vec<u8>> {
         let sha = file_sha256(&asset.abs_path())?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let stored = tx.execute(
             "UPDATE assets SET content_sha256=?1 WHERE id=?2 AND size_bytes=?3 AND mtime_ns=?4",
             params![&sha[..], asset.id, asset.size_bytes as i64, asset.mtime_ns],
         )?;
+        if stored > 0 {
+            reattach_user_data(&tx, asset.id, &sha)?;
+        }
+        tx.commit()?;
         Ok(sha.to_vec())
     }
 
@@ -924,7 +991,7 @@ fn upsert_asset(
     size: i64,
     mtime: i64,
     stats: &mut ScanStats,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     let existing: Option<(i64, i64, i64)> = conn
         .query_row(
             "SELECT id, size_bytes, mtime_ns FROM assets WHERE library_id = ?1 AND rel_path = ?2",
@@ -961,8 +1028,186 @@ fn upsert_asset(
                 params![id, name, rel],
             );
             stats.added += 1;
+            return Ok(Some(id));
         }
     }
+    Ok(None)
+}
+
+/// A file a scan added to the index.
+struct ScannedFile {
+    id: i64,
+    rel: String,
+    format: String,
+    size: i64,
+    mtime: i64,
+}
+
+/// An indexed file a scan no longer found.
+struct GoneFile {
+    id: i64,
+    format: String,
+    size: i64,
+    mtime: i64,
+    sha: Option<Vec<u8>>,
+}
+
+/// Pair files that vanished with files that appeared in the same scan, as
+/// (gone id, added id), when they are the same file renamed or moved:
+///
+/// - the one gone file and the one added file with a given size, mtime and
+///   format (the test a scan already uses to call a file unchanged), or
+/// - an added file with the gone file's size and format whose content hash
+///   (from `hash`) matches the gone file's stored hash, e.g. moved by a copy
+///   that reset its mtime.
+fn plan_moves(
+    gone: &[GoneFile],
+    added: &[ScannedFile],
+    mut hash: impl FnMut(&ScannedFile) -> Option<[u8; 32]>,
+) -> Vec<(i64, i64)> {
+    type Key<'a> = (i64, i64, &'a str);
+    let mut gone_by_key: HashMap<Key, Vec<&GoneFile>> = HashMap::new();
+    for g in gone {
+        gone_by_key
+            .entry((g.size, g.mtime, &g.format))
+            .or_default()
+            .push(g);
+    }
+    let mut added_by_key: HashMap<Key, Vec<&ScannedFile>> = HashMap::new();
+    for a in added {
+        added_by_key
+            .entry((a.size, a.mtime, &a.format))
+            .or_default()
+            .push(a);
+    }
+
+    let mut moves = Vec::new();
+    let mut matched_gone = HashSet::new();
+    let mut claimed = HashSet::new();
+    for (key, gs) in &gone_by_key {
+        if let (&[g], Some(&[a])) = (gs.as_slice(), added_by_key.get(key).map(Vec::as_slice)) {
+            moves.push((g.id, a.id));
+            matched_gone.insert(g.id);
+            claimed.insert(a.id);
+        }
+    }
+
+    let mut hashes: HashMap<i64, Option<[u8; 32]>> = HashMap::new();
+    for g in gone.iter().filter(|g| !matched_gone.contains(&g.id)) {
+        let Some(sha) = g.sha.as_deref() else {
+            continue;
+        };
+        let mut candidates: Vec<&ScannedFile> = added
+            .iter()
+            .filter(|a| !claimed.contains(&a.id) && a.size == g.size && a.format == g.format)
+            .collect();
+        // Same mtime first: likeliest to be this file.
+        candidates.sort_by_key(|a| a.mtime != g.mtime);
+        for a in candidates.into_iter().take(MOVE_HASH_CANDIDATES) {
+            let found = *hashes.entry(a.id).or_insert_with(|| hash(a));
+            if found.is_some_and(|h| h[..] == *sha) {
+                moves.push((g.id, a.id));
+                claimed.insert(a.id);
+                break;
+            }
+        }
+    }
+    moves
+}
+
+/// Point the row of a vanished file (`old_id`) at the file it was moved to,
+/// and drop the row the scan had just added for that file (`new_id`). The
+/// old row keeps its id, so its tags, thumbnail and everything else keyed
+/// by asset id stay with the file. Returns false if either row is gone.
+fn relink_moved(conn: &Connection, old_id: i64, new_id: i64) -> Result<bool> {
+    let new: Option<(String, String, i64, i64)> = conn
+        .query_row(
+            "SELECT rel_path, format, size_bytes, mtime_ns FROM assets WHERE id = ?1",
+            params![new_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let old_exists = conn
+        .query_row(
+            "SELECT 1 FROM assets WHERE id = ?1",
+            params![old_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let (Some((rel, format, size, mtime)), true) = (new, old_exists) else {
+        return Ok(false);
+    };
+    // Tags someone added to the new row in the meantime come along.
+    conn.execute(
+        "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id)
+         SELECT ?1, tag_id FROM asset_tags WHERE asset_id = ?2",
+        params![old_id, new_id],
+    )?;
+    let _ = conn.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![new_id]);
+    conn.execute("DELETE FROM assets WHERE id = ?1", params![new_id])?;
+    conn.execute(
+        "UPDATE assets SET rel_path = ?1, format = ?2, size_bytes = ?3, mtime_ns = ?4
+         WHERE id = ?5",
+        params![rel, format, size, mtime, old_id],
+    )?;
+    refresh_fts(conn, old_id)?;
+    Ok(true)
+}
+
+/// Keep aside the user data of the assets matching `condition` (SQL on
+/// `assets a`, with `?1` bound to `arg`) before they leave the index, keyed
+/// by content hash. Assets without a hash or without user data are skipped.
+fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO detached_meta (content_sha256, data, detached_at)
+             SELECT a.content_sha256, json_object(
+                 'tags', json((SELECT json_group_array(t.name) FROM asset_tags at
+                               JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = a.id))
+               ), ?2
+             FROM assets a
+             WHERE ({condition}) AND a.content_sha256 IS NOT NULL
+               AND EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)"
+        ),
+        params![arg, now_secs()],
+    )?;
+    Ok(())
+}
+
+/// Give asset `id` the user data stashed for content hash `sha`, if any and
+/// if the asset has none of its own. The stash is used up either way, so
+/// only one copy of the file gets it.
+fn reattach_user_data(conn: &Connection, id: i64, sha: &[u8]) -> Result<()> {
+    let Some(data) = conn
+        .query_row(
+            "SELECT data FROM detached_meta WHERE content_sha256 = ?1",
+            params![sha],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let has_own: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if !has_own {
+        let mut stmt = conn.prepare("SELECT value FROM json_each(?1, '$.tags')")?;
+        let tags: Vec<String> = stmt
+            .query_map(params![data], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for tag in &tags {
+            insert_asset_tag(conn, id, tag)?;
+        }
+        refresh_fts(conn, id)?;
+    }
+    conn.execute(
+        "DELETE FROM detached_meta WHERE content_sha256 = ?1",
+        params![sha],
+    )?;
     Ok(())
 }
 
@@ -1882,6 +2127,264 @@ mod tests {
         // Other tags survive, and FTS still has them.
         assert_eq!(search("keep"), ["a.stl"]);
         assert_eq!(fts_rows(&cat), 3);
+    }
+
+    fn tags_of(cat: &Catalog, rel: &str) -> Vec<String> {
+        cat.assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|a| a.rel_path == rel)
+            .map(|a| a.tags)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rename_and_move_keep_the_row_tags_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl"]);
+        let a = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "a.stl")
+            .unwrap();
+        let sha = cat.hash_asset(&a).unwrap();
+        cat.set_thumb_state(a.id, ThumbState::Ready, None).unwrap();
+        cat.set_tags(a.id, &["boat".into()]).unwrap();
+
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::rename(dir.path().join("a.stl"), dir.path().join("sub/renamed.stl")).unwrap();
+        let stats = cat.scan_library(&lib).unwrap();
+        assert_eq!((stats.moved, stats.added, stats.removed), (1, 0, 0));
+
+        let moved = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "sub/renamed.stl")
+            .unwrap();
+        assert_eq!(moved.id, ids["a.stl"]);
+        assert_eq!(moved.tags, ["boat"]);
+        assert_eq!(moved.content_sha256.as_deref(), Some(&sha[..]));
+        assert_eq!(moved.thumb_state, ThumbState::Ready);
+        assert_eq!(fts_rows(&cat), 2);
+        let search = |q: &str| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    search: Some(q.into()),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(search("renamed"), ["sub/renamed.stl"]);
+        assert_eq!(search("boat"), ["sub/renamed.stl"]);
+        assert!(cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .iter()
+            .all(|x| x.rel_path != "a.stl"));
+    }
+
+    #[test]
+    fn move_that_changed_mtime_is_matched_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.stl"), "solid a\nendsolid a\n").unwrap();
+        fs::write(root.join("unhashed.stl"), "solid u\nendsolid u\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let by_rel = |rel: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|x| x.rel_path == rel)
+        };
+        let a = by_rel("a.stl").unwrap();
+        cat.hash_asset(&a).unwrap();
+        cat.set_tags(a.id, &["kept".into()]).unwrap();
+        let u = by_rel("unhashed.stl").unwrap();
+        cat.set_tags(u.id, &["lost".into()]).unwrap();
+
+        // Copy-then-delete moves give the new file a new mtime.
+        for (from, to, secs) in [("a.stl", "b.stl", 1_000), ("unhashed.stl", "v.stl", 2_000)] {
+            fs::copy(root.join(from), root.join(to)).unwrap();
+            set_mtime(&root.join(to), secs);
+            fs::remove_file(root.join(from)).unwrap();
+        }
+        let stats = cat.scan_library(&lib).unwrap();
+        assert_eq!((stats.moved, stats.added, stats.removed), (1, 1, 1));
+        assert_eq!(by_rel("b.stl").unwrap().id, a.id);
+        assert_eq!(tags_of(&cat, "b.stl"), ["kept"]);
+        // No hash to confirm it by, and the mtime changed: a new asset.
+        assert!(tags_of(&cat, "v.stl").is_empty());
+    }
+
+    #[test]
+    fn identical_files_moved_together_keep_their_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (cat, lib, _) = catalog_with(root, &["one.stl", "two.stl"]);
+        for (rel, secs) in [("one.stl", 5_000), ("two.stl", 5_000)] {
+            set_mtime(&root.join(rel), secs);
+        }
+        cat.scan_library(&lib).unwrap();
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            cat.hash_asset(&asset).unwrap();
+            cat.set_tags(asset.id, &[asset.rel_path.replace(".stl", "")])
+                .unwrap();
+        }
+        fs::create_dir(root.join("moved")).unwrap();
+        for rel in ["one.stl", "two.stl"] {
+            fs::rename(root.join(rel), root.join("moved").join(rel)).unwrap();
+        }
+        let stats = cat.scan_library(&lib).unwrap();
+        // Same size and mtime: ambiguous, so the hash pairs them up.
+        assert_eq!((stats.moved, stats.added, stats.removed), (2, 0, 0));
+        let mut tags: Vec<String> = ["moved/one.stl", "moved/two.stl"]
+            .into_iter()
+            .flat_map(|rel| tags_of(&cat, rel))
+            .collect();
+        tags.sort();
+        assert_eq!(tags, ["one", "two"]);
+    }
+
+    #[test]
+    fn tags_follow_a_file_into_another_library_once() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("boat.stl"), "solid boat\nendsolid boat\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let boat = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&boat).unwrap();
+        cat.set_tags(boat.id, &["boat".into(), "校準".into()])
+            .unwrap();
+
+        fs::copy(a.path().join("boat.stl"), b.path().join("boat.stl")).unwrap();
+        fs::copy(a.path().join("boat.stl"), b.path().join("copy.stl")).unwrap();
+        fs::remove_file(a.path().join("boat.stl")).unwrap();
+        assert_eq!(cat.scan_library(&lib_a).unwrap().removed, 1);
+        cat.scan_library(&lib_b).unwrap();
+        assert!(tags_of(&cat, "boat.stl").is_empty(), "not hashed yet");
+
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            cat.hash_asset(&asset).unwrap();
+        }
+        let tagged: Vec<Vec<String>> = ["boat.stl", "copy.stl"]
+            .into_iter()
+            .map(|rel| tags_of(&cat, rel))
+            .collect();
+        // Whichever copy was hashed first got the tags; the other did not.
+        assert_eq!(tagged.iter().filter(|t| !t.is_empty()).count(), 1);
+        assert!(tagged.contains(&vec!["boat".to_string(), "校準".to_string()]));
+        assert_eq!(
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    search: Some("校準".into()),
+                    ..Default::default()
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn removed_library_gets_its_tags_back_when_added_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, ids) = catalog_with(dir.path(), &["a.stl"]);
+        let a = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&a).unwrap();
+        cat.set_tags(ids["a.stl"], &["keep".into()]).unwrap();
+        cat.remove_library(lib.id).unwrap();
+
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let a = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        assert!(a.tags.is_empty());
+        cat.hash_asset(&a).unwrap();
+        assert_eq!(tags_of(&cat, "a.stl"), ["keep"]);
+    }
+
+    #[test]
+    fn stashed_tags_never_overwrite_an_assets_own_tags() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("x.stl"), "solid x\nendsolid x\n").unwrap();
+        fs::write(b.path().join("x.stl"), "solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            let tag = if asset.library_id == lib_a.id {
+                "old"
+            } else {
+                "mine"
+            };
+            cat.set_tags(asset.id, &[tag.into()]).unwrap();
+            if asset.library_id == lib_a.id {
+                cat.hash_asset(&asset).unwrap();
+            }
+        }
+        fs::remove_file(a.path().join("x.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let mine = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&mine).unwrap();
+        assert_eq!(tags_of(&cat, "x.stl"), ["mine"]);
+    }
+
+    #[test]
+    fn plan_moves_pairs_unique_matches_and_confirms_the_rest_by_hash() {
+        let gone = |id, size, mtime, sha: Option<u8>| GoneFile {
+            id,
+            format: "stl".into(),
+            size,
+            mtime,
+            sha: sha.map(|b| vec![b; 32]),
+        };
+        let added = |id, size, mtime| ScannedFile {
+            id,
+            rel: format!("{id}.stl"),
+            format: "stl".into(),
+            size,
+            mtime,
+        };
+        let mut hashed = Vec::new();
+        let moves = plan_moves(
+            &[
+                gone(1, 10, 100, None),
+                gone(2, 20, 200, Some(7)),
+                gone(3, 30, 300, None),
+            ],
+            &[
+                added(11, 10, 100),
+                added(12, 20, 999),
+                added(13, 30, 301),
+                added(14, 20, 998),
+            ],
+            |a| {
+                hashed.push(a.id);
+                Some([if a.id == 12 { 7 } else { 0 }; 32])
+            },
+        );
+        let mut moves = moves;
+        moves.sort();
+        assert_eq!(moves, [(1, 11), (2, 12)]);
+        // Only same-size candidates of a gone file that had a hash.
+        hashed.sort();
+        assert!(hashed.iter().all(|id| [12, 14].contains(id)));
+
+        // A format change is never a move.
+        let mut other = added(21, 10, 100);
+        other.format = "obj".into();
+        assert!(plan_moves(&[gone(1, 10, 100, Some(1))], &[other], |_| Some([1; 32])).is_empty());
     }
 
     #[test]
