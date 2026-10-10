@@ -119,6 +119,9 @@ pub enum Key {
     RemoveTag,
     RegenerateThumbs,
     TrashDetailMany,
+    Favorites,
+    AddToFavorites,
+    RemoveFromFavorites,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -455,6 +458,12 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::RegenerateThumbs) => "Regenerate Thumbnails",
         (Language::Chinese, Key::TrashDetailMany) => "原始檔案會移到系統垃圾桶，可從垃圾桶復原。",
         (Language::English, Key::TrashDetailMany) => "The original files will be moved to the system Trash, where you can restore them.",
+        (Language::Chinese, Key::Favorites) => "我的最愛",
+        (Language::English, Key::Favorites) => "Favorites",
+        (Language::Chinese, Key::AddToFavorites) => "加入我的最愛",
+        (Language::English, Key::AddToFavorites) => "Add to Favorites",
+        (Language::Chinese, Key::RemoveFromFavorites) => "從我的最愛移除",
+        (Language::English, Key::RemoveFromFavorites) => "Remove from Favorites",
     }
 }
 
@@ -623,6 +632,9 @@ mod tests {
             Key::RemoveTag,
             Key::RegenerateThumbs,
             Key::TrashDetailMany,
+            Key::Favorites,
+            Key::AddToFavorites,
+            Key::RemoveFromFavorites,
         ];
         for key in KEYS {
             assert!(

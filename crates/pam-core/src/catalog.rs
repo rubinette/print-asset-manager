@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS asset_tags (
   PRIMARY KEY (asset_id, tag_id)
 );
 
+-- Its own table rather than an assets column: there are no migrations, and
+-- CREATE TABLE IF NOT EXISTS reaches catalogs made before favorites existed.
+CREATE TABLE IF NOT EXISTS favorites (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_assets_thumb_state ON assets(thumb_state);
 CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag_id);
 CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(content_sha256);
@@ -109,6 +115,7 @@ pub struct Asset {
     pub thumb_state: ThumbState,
     pub error: Option<String>,
     pub tags: Vec<String>,
+    pub favorite: bool,
 }
 
 impl Asset {
@@ -273,6 +280,7 @@ pub struct AssetQuery {
     pub file_size: Option<(u64, Option<u64>)>,
     pub modified_since_ns: Option<i64>,
     pub untagged: bool,
+    pub favorites_only: bool,
     /// Only assets whose content hash is shared with another asset.
     pub duplicates_only: bool,
     pub search: Option<String>,
@@ -452,7 +460,8 @@ impl Catalog {
                     a.content_sha256, a.triangle_count,
                     a.bbox_min_x, a.bbox_min_y, a.bbox_min_z,
                     a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
-                    a.thumb_state, a.error
+                    a.thumb_state, a.error,
+                    EXISTS (SELECT 1 FROM favorites f WHERE f.asset_id = a.id)
              FROM assets a
              JOIN libraries l ON l.id = a.library_id
              WHERE 1=1",
@@ -484,6 +493,9 @@ impl Catalog {
         }
         if query.untagged {
             sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
+        }
+        if query.favorites_only {
+            sql.push_str(" AND a.id IN (SELECT asset_id FROM favorites)");
         }
         if !query.formats.is_empty() {
             sql.push_str(&format!(
@@ -592,6 +604,7 @@ impl Catalog {
                 thumb_state: ThumbState::parse(&r.get::<_, String>(15)?),
                 error: r.get(16)?,
                 tags: Vec::new(),
+                favorite: r.get(17)?,
             });
         }
         drop(rows);
@@ -803,6 +816,31 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Star or unstar every asset in `ids`.
+    pub fn set_favorite(&self, ids: &[i64], favorite: bool) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for &id in ids {
+            if favorite {
+                tx.execute(
+                    "INSERT OR IGNORE INTO favorites (asset_id)
+                     SELECT id FROM assets WHERE id = ?1",
+                    params![id],
+                )?;
+            } else {
+                tx.execute("DELETE FROM favorites WHERE asset_id = ?1", params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn favorite_count(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))?;
+        Ok(n as u32)
     }
 
     /// Relative paths of every asset in a library, for building its folder tree.
@@ -1797,6 +1835,57 @@ mod tests {
         // Other tags survive, and FTS still has them.
         assert_eq!(search("keep"), ["a.stl"]);
         assert_eq!(fts_rows(&cat), 3);
+    }
+
+    #[test]
+    fn favorites_filter_survive_edits_and_follow_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "c.stl"]);
+        let favorites = |cat: &Catalog| {
+            rel_paths_of(
+                cat,
+                AssetQuery {
+                    favorites_only: true,
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(favorites(&cat).is_empty());
+
+        cat.set_favorite(&[ids["a.stl"], ids["b.stl"]], true)
+            .unwrap();
+        // Starring twice, or an id that isn't an asset, is a no-op.
+        cat.set_favorite(&[ids["a.stl"], 9_999], true).unwrap();
+        assert_eq!(favorites(&cat), ["a.stl", "b.stl"]);
+        assert_eq!(cat.favorite_count().unwrap(), 2);
+        let flags: HashMap<String, bool> = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.rel_path, a.favorite))
+            .collect();
+        assert!(flags["a.stl"] && flags["b.stl"] && !flags["c.stl"]);
+
+        cat.set_favorite(&[ids["b.stl"]], false).unwrap();
+        assert_eq!(favorites(&cat), ["a.stl"]);
+
+        // Editing the file keeps the star; deleting it drops the star.
+        fs::write(
+            dir.path().join("a.stl"),
+            "solid changed\nendsolid changed\n",
+        )
+        .unwrap();
+        set_mtime(&dir.path().join("a.stl"), 1_000_000);
+        cat.scan_library(&lib).unwrap();
+        assert_eq!(favorites(&cat), ["a.stl"]);
+        fs::remove_file(dir.path().join("a.stl")).unwrap();
+        cat.scan_library(&lib).unwrap();
+        assert!(favorites(&cat).is_empty());
+        assert_eq!(cat.favorite_count().unwrap(), 0);
+
+        cat.set_favorite(&[ids["c.stl"]], true).unwrap();
+        cat.remove_library(lib.id).unwrap();
+        assert_eq!(cat.favorite_count().unwrap(), 0);
     }
 
     #[test]

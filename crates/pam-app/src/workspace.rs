@@ -31,8 +31,8 @@ use crate::i18n::{self, Key, LanguagePref};
 use crate::jobs;
 use crate::{
     apply_language, apply_system_theme, AddFolder, FocusSearch, OpenSelected, SelectAll,
-    SelectDown, SelectLeft, SelectRight, SelectUp, TrashSelected, UseChinese, UseEnglish,
-    UseSystemLanguage,
+    SelectDown, SelectLeft, SelectRight, SelectUp, ToggleFavorite, TrashSelected, UseChinese,
+    UseEnglish, UseSystemLanguage,
 };
 
 /// Key context of the asset grid/list; arrow-key bindings only apply inside it.
@@ -164,6 +164,7 @@ enum Location {
         dir: Option<String>,
     },
     Duplicates,
+    Favorites,
 }
 
 /// File size ranges in MB.
@@ -450,6 +451,7 @@ pub struct Workspace {
     /// Expanded tree nodes as (library id, folder path); "" is the library itself.
     expanded: HashSet<(i64, String)>,
     duplicate_count: u32,
+    favorite_count: u32,
     /// Assets sharing the primary selection's content hash, itself included.
     selected_copies: u32,
     search: Entity<InputState>,
@@ -574,6 +576,7 @@ impl Workspace {
             folder_trees: HashMap::new(),
             expanded: HashSet::new(),
             duplicate_count: 0,
+            favorite_count: 0,
             selected_copies: 0,
             search,
             tag_input,
@@ -645,6 +648,9 @@ impl Workspace {
         if let Ok(n) = self.catalog.duplicate_count() {
             self.duplicate_count = n;
         }
+        if let Ok(n) = self.catalog.favorite_count() {
+            self.favorite_count = n;
+        }
         match self.catalog.assets(&self.query()) {
             Ok(assets) => self.assets = assets,
             Err(err) => eprintln!("catalog query failed: {err}"),
@@ -673,7 +679,7 @@ impl Workspace {
     fn query(&self) -> AssetQuery {
         let (library_id, dir) = match &self.location {
             Location::Library { id, dir } => (Some(*id), dir.clone()),
-            Location::All | Location::Duplicates => (None, None),
+            Location::All | Location::Duplicates | Location::Favorites => (None, None),
         };
         let f = &self.filters;
         AssetQuery {
@@ -690,6 +696,7 @@ impl Workspace {
             untagged: f.untagged,
             thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
             duplicates_only: self.location == Location::Duplicates,
+            favorites_only: self.location == Location::Favorites,
             search: if self.search_text.trim().is_empty() {
                 None
             } else {
@@ -705,7 +712,7 @@ impl Workspace {
     fn is_filtered(&self) -> bool {
         self.filters != Filters::default()
             || !self.search_text.trim().is_empty()
-            || self.location == Location::Duplicates
+            || matches!(self.location, Location::Duplicates | Location::Favorites)
     }
 
     /// Rebuild the sidebar folder trees. Separate from `reload` because that
@@ -856,6 +863,32 @@ impl Workspace {
         } else {
             vec![id]
         }
+    }
+
+    /// Whether every asset in `ids` is starred, so toggling them unstars.
+    fn all_favorite(&self, ids: &[i64]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        let starred: HashSet<i64> = self
+            .assets
+            .iter()
+            .filter(|a| a.favorite)
+            .map(|a| a.id)
+            .collect();
+        ids.iter().all(|id| starred.contains(id))
+    }
+
+    /// Unstar `ids` if they are all starred, otherwise star them all.
+    fn toggle_favorite(&mut self, ids: &[i64], cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let favorite = !self.all_favorite(ids);
+        if let Err(err) = self.catalog.set_favorite(ids, favorite) {
+            eprintln!("set favorite failed: {err}");
+        }
+        self.reload(cx);
     }
 
     /// Ask, then move the files to the system Trash and drop them from the index.
@@ -1514,6 +1547,10 @@ impl Render for Workspace {
                 let ids = this.selection.clone();
                 this.confirm_trash(&ids, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleFavorite, _, cx| {
+                let ids = this.selection.clone();
+                this.toggle_favorite(&ids, cx);
+            }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 window.focus(&this.search.read(cx).focus_handle(cx), cx);
             }))
@@ -2047,6 +2084,22 @@ fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             }),
             &theme,
         ))
+        // Stays while open so unstarring the last file doesn't yank the view away.
+        .when(
+            this.favorite_count > 0 || this.location == Location::Favorites,
+            |el| {
+                el.child(nav_item(
+                    "nav-favorites",
+                    Lucide::Star.into(),
+                    i18n::t(Key::Favorites).to_string(),
+                    Some(this.favorite_count.to_string()),
+                    this.location == Location::Favorites,
+                    false,
+                    cx.listener(|this, _, _, cx| this.set_location(Location::Favorites, cx)),
+                    &theme,
+                ))
+            },
+        )
         .when(this.duplicate_count > 0, |el| {
             el.child(nav_item(
                 "nav-duplicates",
@@ -2502,19 +2555,26 @@ fn asset_interactions(
         });
     })
     .context_menu(move |menu, _, cx| {
-        let targets = workspace
+        let (targets, all_favorite) = workspace
             .upgrade()
-            .map(|w| w.read(cx).targets_for(id))
-            .unwrap_or_else(|| vec![id]);
-        asset_menu(menu, targets, path.clone(), workspace.clone())
+            .map(|w| {
+                let this = w.read(cx);
+                let targets = this.targets_for(id);
+                let all_favorite = this.all_favorite(&targets);
+                (targets, all_favorite)
+            })
+            .unwrap_or_else(|| (vec![id], false));
+        asset_menu(menu, targets, all_favorite, path.clone(), workspace.clone())
     })
 }
 
-/// Open / reveal / copy act on the clicked asset; thumbnail and trash items
-/// act on every target (the selection, when the click was inside it).
+/// Open / reveal / copy act on the clicked asset; favorite, thumbnail and
+/// trash items act on every target (the selection, when the click was inside
+/// it).
 fn asset_menu(
     menu: PopupMenu,
     targets: Vec<i64>,
+    all_favorite: bool,
     path: std::path::PathBuf,
     workspace: WeakEntity<Workspace>,
 ) -> PopupMenu {
@@ -2526,6 +2586,7 @@ fn asset_menu(
         i18n::t(Key::MoveToTrashEllipsis).to_string()
     };
     let regenerate_targets = targets.clone();
+    let favorite_targets = targets.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(Key::Open))
             .icon(IconName::ExternalLink)
@@ -2546,6 +2607,22 @@ fn asset_menu(
             }),
     )
     .separator()
+    .item({
+        let workspace = workspace.clone();
+        PopupMenuItem::new(i18n::t(if all_favorite {
+            Key::RemoveFromFavorites
+        } else {
+            Key::AddToFavorites
+        }))
+        .icon(Icon::new(if all_favorite {
+            Lucide::StarOff
+        } else {
+            Lucide::Star
+        }))
+        .on_click(move |_, _, cx| {
+            let _ = workspace.update(cx, |this, cx| this.toggle_favorite(&favorite_targets, cx));
+        })
+    })
     .item({
         let workspace = workspace.clone();
         PopupMenuItem::new(i18n::t(if many {
@@ -2613,7 +2690,19 @@ fn card(
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(asset.format.label()),
-                ),
+                )
+                .when(asset.favorite, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .p_0p5()
+                            .rounded_sm()
+                            .bg(theme.background.opacity(0.85))
+                            .child(favorite_icon(&theme)),
+                    )
+                }),
         )
         .child(
             v_flex()
@@ -2634,6 +2723,12 @@ fn card(
                 ),
         );
     asset_interactions(el, asset, workspace)
+}
+
+fn favorite_icon(theme: &gpui_kit::component::Theme) -> Icon {
+    Icon::new(Lucide::StarFill)
+        .xsmall()
+        .text_color(theme.warning)
 }
 
 /// "12,345 △ · 60×31×48 mm", or whatever of it is known yet.
@@ -2840,10 +2935,19 @@ fn list_row(
                 .flex_1()
                 .min_w_0()
                 .child(
-                    div()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(asset.name().to_string()),
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(asset.name().to_string()),
+                        )
+                        .when(asset.favorite, |el| {
+                            el.child(favorite_icon(&theme).flex_shrink_0())
+                        }),
                 )
                 .when(!folder.is_empty(), |el| {
                     el.child(
@@ -3068,6 +3172,24 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                         .label(i18n::t(Key::Open))
                         .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
                 )
+                .child({
+                    let (id, favorite) = (asset.id, asset.favorite);
+                    Button::new("favorite")
+                        .outline()
+                        .icon(if favorite {
+                            favorite_icon(&theme)
+                        } else {
+                            Icon::new(Lucide::Star)
+                        })
+                        .tooltip(i18n::t(if favorite {
+                            Key::RemoveFromFavorites
+                        } else {
+                            Key::AddToFavorites
+                        }))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.toggle_favorite(&[id], cx)),
+                        )
+                })
                 .child(
                     Button::new("reveal")
                         .outline()
@@ -3144,6 +3266,25 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
                             )
                     })),
             )
+        })
+        .child({
+            let all_favorite = this.all_favorite(&this.selection);
+            Button::new("favorite-selection")
+                .outline()
+                .icon(Icon::new(if all_favorite {
+                    Lucide::StarOff
+                } else {
+                    Lucide::Star
+                }))
+                .label(i18n::t(if all_favorite {
+                    Key::RemoveFromFavorites
+                } else {
+                    Key::AddToFavorites
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let ids = this.selection.clone();
+                    this.toggle_favorite(&ids, cx)
+                }))
         })
         .child(
             Button::new("trash-selection")
@@ -3367,6 +3508,7 @@ mod helper_tests {
             thumb_state: pam_core::catalog::ThumbState::Pending,
             error: None,
             tags: Vec::new(),
+            favorite: false,
         }
     }
 

@@ -23,6 +23,7 @@ actions!(
         SelectUp,
         SelectDown,
         SelectAll,
+        ToggleFavorite,
         TrashSelected
     ]
 );
@@ -62,6 +63,8 @@ fn main() {
                 Some(workspace::ASSET_VIEW_CONTEXT),
             ),
             KeyBinding::new("delete", TrashSelected, Some(workspace::ASSET_VIEW_CONTEXT)),
+            // Plain key, but only while the grid/list has focus, not in text fields.
+            KeyBinding::new("f", ToggleFavorite, Some(workspace::ASSET_VIEW_CONTEXT)),
         ]);
 
         install_menus(cx);
