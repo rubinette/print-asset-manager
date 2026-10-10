@@ -139,21 +139,27 @@ impl Workspace {
         self.thumb_done = 0;
         self.thumb_total = self.catalog.pending_count().unwrap_or(0);
         let catalog = self.catalog.clone();
-        let hashed = Arc::new(AtomicU32::new(0));
+        let indexed = Arc::new(AtomicU32::new(0));
         let done = Arc::new(AtomicU32::new(0));
         cx.spawn(async move |this, cx| loop {
             this.update(cx, |this, _cx| {
                 this.thumbs_wanted = false;
             })
             .ok();
-            let (catalog2, hashed2, done2) = (catalog.clone(), hashed.clone(), done.clone());
+            let (catalog2, indexed2, done2) = (catalog.clone(), indexed.clone(), done.clone());
             let (done_tx, done_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                jobs::drain(&catalog2, &hashed2, &done2);
+                jobs::drain(&catalog2, &indexed2, &done2);
                 let _ = done_tx.send(());
             });
-            // New hashes change the duplicates count, new thumbnails the grid.
-            let progress = || (hashed.load(Ordering::Relaxed), done.load(Ordering::Relaxed));
+            // New hashes change the duplicates count, print info the
+            // inspector and filters, new thumbnails the grid.
+            let progress = || {
+                (
+                    indexed.load(Ordering::Relaxed),
+                    done.load(Ordering::Relaxed),
+                )
+            };
             let mut reloaded = progress();
             let mut last_reload = Instant::now();
             loop {

@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use crate::error::Result;
 use crate::hash::file_sha256;
 use crate::mesh::{AssetFormat, BBox};
+use crate::print_info::{PrintInfo, PRINT_INFO_VERSION};
 
 /// Files written per scan transaction.
 const SCAN_CHUNK: usize = 500;
@@ -63,6 +64,22 @@ CREATE TABLE IF NOT EXISTS asset_notes (
   status TEXT,
   status_at INTEGER,
   note TEXT NOT NULL DEFAULT ''
+);
+
+-- Slicer metadata read from 3MF files (`print_info.rs`). Every 3MF gets a
+-- row once read, empty or not, so it isn't read again; rows written by an
+-- older PRINT_INFO_VERSION are read again. `materials` is a JSON array.
+CREATE TABLE IF NOT EXISTS print_info (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  title TEXT,
+  designer TEXT,
+  application TEXT,
+  printer TEXT,
+  materials TEXT NOT NULL DEFAULT '[]',
+  print_time_s INTEGER,
+  filament_g REAL,
+  layer_height REAL
 );
 
 -- User data (tags, ...) of files that left the index, keyed by content hash,
@@ -174,6 +191,8 @@ pub struct Asset {
     pub status_at: Option<i64>,
     /// Free text; empty when there is none.
     pub note: String,
+    /// Slicer metadata of a 3MF, once read; `None` for other formats.
+    pub print: Option<PrintInfo>,
 }
 
 impl Asset {
@@ -349,6 +368,11 @@ pub struct AssetQuery {
     /// Only assets whose content hash is shared with another asset.
     pub duplicates_only: bool,
     pub search: Option<String>,
+    /// 3MF files whose slicer settings use any of these filament types.
+    pub materials: Vec<String>,
+    /// Estimated print time range in seconds: at least `.0`, below `.1`.
+    /// Files without an estimate are left out.
+    pub print_time: Option<(u64, Option<u64>)>,
     pub thumb_state: Option<ThumbState>,
     /// Skip libraries whose root is missing (e.g. NAS offline).
     pub online_only: bool,
@@ -653,14 +677,36 @@ impl Catalog {
                       ) OR a.id IN (
                         SELECT asset_id FROM asset_notes WHERE note LIKE ? ESCAPE '\\'
                       ) OR a.id IN (
+                        SELECT asset_id FROM print_info
+                        WHERE COALESCE(title, '') || ' ' || COALESCE(designer, '') || ' '
+                              || COALESCE(printer, '') || ' ' || materials LIKE ? ESCAPE '\\'
+                      ) OR a.id IN (
                         SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
                       ))",
                 );
                 args.push(like.clone().into());
                 args.push(like.clone().into());
+                args.push(like.clone().into());
                 args.push(like.into());
                 args.push(fts_query(&search).into());
             }
+        }
+        if !query.materials.is_empty() {
+            sql.push_str(&format!(
+                " AND a.id IN (SELECT p.asset_id FROM print_info p, json_each(p.materials) m
+                   WHERE m.value IN ({}))",
+                placeholders(query.materials.len())
+            ));
+            args.extend(query.materials.iter().map(|m| m.clone().into()));
+        }
+        if let Some((min, max)) = query.print_time {
+            sql.push_str(" AND a.id IN (SELECT asset_id FROM print_info WHERE print_time_s >= ?");
+            args.push((min as i64).into());
+            if let Some(max) = max {
+                sql.push_str(" AND print_time_s < ?");
+                args.push((max as i64).into());
+            }
+            sql.push(')');
         }
         if let Some(state) = query.thumb_state {
             sql.push_str(" AND a.thumb_state = ?");
@@ -767,6 +813,67 @@ impl Catalog {
         args.push((limit as i64).into());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args), asset_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Up to `limit` 3MF assets in online libraries whose slicer metadata
+    /// hasn't been read (or was read by an older version), in id order after
+    /// `after_id`, like [`Self::unhashed_assets`].
+    pub fn assets_without_print_info(&self, after_id: i64, limit: usize) -> Result<Vec<Asset>> {
+        let online = self.online_library_ids()?;
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "{SELECT_ASSETS} WHERE a.format = 'threemf' AND a.id > ?
+               AND (p.asset_id IS NULL OR p.version < ?)
+               AND a.library_id IN ({}) ORDER BY a.id LIMIT ?",
+            placeholders(online.len())
+        );
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![after_id.into(), PRINT_INFO_VERSION.into()];
+        args.extend(online.into_iter().map(Into::into));
+        args.push((limit as i64).into());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), asset_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Store what was read from `asset`'s file, unless a scan has seen the
+    /// file change since `asset` was read (as in [`Self::hash_asset`]).
+    pub fn set_print_info(&self, asset: &Asset, info: &PrintInfo) -> Result<()> {
+        let materials = serde_json::to_string(&info.materials).unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO print_info (asset_id, version, title, designer, application,
+                 printer, materials, print_time_s, filament_g, layer_height)
+             SELECT id, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 FROM assets
+             WHERE id = ?1 AND size_bytes = ?2 AND mtime_ns = ?3",
+            params![
+                asset.id,
+                asset.size_bytes as i64,
+                asset.mtime_ns,
+                PRINT_INFO_VERSION,
+                info.title,
+                info.designer,
+                info.application,
+                info.printer,
+                materials,
+                info.print_time_s.map(|s| s as i64),
+                info.filament_g,
+                info.layer_height_mm,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Filament types found in 3MF files, with how many files use each,
+    /// most used first.
+    pub fn all_materials(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.value, COUNT(*) FROM print_info p, json_each(p.materials) m
+             GROUP BY m.value ORDER BY COUNT(*) DESC, m.value",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -998,10 +1105,13 @@ const SELECT_ASSETS: &str = "SELECT a.id, a.library_id, l.root_path, a.rel_path,
         a.size_bytes, a.mtime_ns, a.content_sha256, a.triangle_count,
         a.bbox_min_x, a.bbox_min_y, a.bbox_min_z,
         a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
-        a.thumb_state, a.error, n.status, n.status_at, COALESCE(n.note, '')
+        a.thumb_state, a.error, n.status, n.status_at, COALESCE(n.note, ''),
+        p.asset_id, p.title, p.designer, p.application, p.printer, p.materials,
+        p.print_time_s, p.filament_g, p.layer_height
  FROM assets a
  JOIN libraries l ON l.id = a.library_id
- LEFT JOIN asset_notes n ON n.asset_id = a.id";
+ LEFT JOIN asset_notes n ON n.asset_id = a.id
+ LEFT JOIN print_info p ON p.asset_id = a.id";
 
 /// An [`Asset`] from a [`SELECT_ASSETS`] row, without its tags.
 fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
@@ -1040,6 +1150,22 @@ fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
             .and_then(PrintStatus::parse),
         status_at: r.get(18)?,
         note: r.get(19)?,
+        print: match r.get::<_, Option<i64>>(20)? {
+            None => None,
+            Some(_) => Some(PrintInfo {
+                title: r.get(21)?,
+                designer: r.get(22)?,
+                application: r.get(23)?,
+                printer: r.get(24)?,
+                materials: r
+                    .get::<_, Option<String>>(25)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
+                print_time_s: r.get::<_, Option<i64>>(26)?.map(|s| s.max(0) as u64),
+                filament_g: r.get(27)?,
+                layer_height_mm: r.get(28)?,
+            }),
+        },
     })
 }
 
@@ -1124,6 +1250,7 @@ fn upsert_asset(
                  WHERE id=?4",
                 params![format.as_str(), size, mtime, id],
             )?;
+            conn.execute("DELETE FROM print_info WHERE asset_id = ?1", params![id])?;
             stats.updated += 1;
         }
         None => {
@@ -2558,6 +2685,137 @@ mod tests {
         );
         cat.hash_asset(&find("y.stl")).unwrap();
         assert_eq!(find("y.stl").note, "elsewhere");
+    }
+
+    #[test]
+    fn print_info_is_read_once_per_3mf_and_again_after_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, _) = catalog_with(dir.path(), &["a.3mf", "b.3mf", "c.stl"]);
+        let pending = |cat: &Catalog| -> Vec<String> {
+            let mut out: Vec<String> = cat
+                .assets_without_print_info(0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.rel_path)
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(pending(&cat), ["a.3mf", "b.3mf"]);
+        let first = cat.assets_without_print_info(0, 1).unwrap().pop().unwrap();
+        assert_eq!(
+            cat.assets_without_print_info(first.id, 10).unwrap().len(),
+            1
+        );
+        let a = cat
+            .assets_without_print_info(0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "a.3mf")
+            .unwrap();
+        let info = PrintInfo {
+            title: Some("Benchy".into()),
+            materials: vec!["PLA".into(), "PETG".into()],
+            print_time_s: Some(3_000),
+            ..Default::default()
+        };
+        cat.set_print_info(&a, &info).unwrap();
+        let b = cat.assets_without_print_info(0, 10).unwrap().pop().unwrap();
+        assert_eq!(b.rel_path, "b.3mf");
+        cat.set_print_info(&b, &PrintInfo::default()).unwrap();
+        assert!(pending(&cat).is_empty(), "empty results count as read");
+        let stored = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.rel_path, x.print))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(stored["a.3mf"].as_ref(), Some(&info));
+        assert_eq!(stored["b.3mf"], Some(PrintInfo::default()));
+        assert_eq!(stored["c.stl"], None);
+
+        // A changed file is read again, and a result for the old contents
+        // is not stored.
+        fs::write(dir.path().join("a.3mf"), "changed").unwrap();
+        set_mtime(&dir.path().join("a.3mf"), 7_000);
+        cat.scan_library(&lib).unwrap();
+        assert_eq!(pending(&cat), ["a.3mf"]);
+        cat.set_print_info(&a, &info).unwrap();
+        assert_eq!(pending(&cat), ["a.3mf"]);
+
+        // Rows from an older reader version are read again.
+        cat.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE print_info SET version = 0", [])
+            .unwrap();
+        assert_eq!(pending(&cat), ["a.3mf", "b.3mf"]);
+    }
+
+    #[test]
+    fn print_info_filters_by_material_and_time_and_is_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _lib, _) = catalog_with(dir.path(), &["quick.3mf", "long.3mf", "plain.3mf"]);
+        for asset in cat.assets_without_print_info(0, 10).unwrap() {
+            let info = match asset.rel_path.as_str() {
+                "quick.3mf" => PrintInfo {
+                    printer: Some("Bambu Lab A1 mini 0.4 nozzle".into()),
+                    materials: vec!["PLA".into()],
+                    print_time_s: Some(1_800),
+                    ..Default::default()
+                },
+                "long.3mf" => PrintInfo {
+                    designer: Some("Ada".into()),
+                    materials: vec!["PETG".into(), "PLA".into()],
+                    print_time_s: Some(5 * 3_600),
+                    ..Default::default()
+                },
+                _ => PrintInfo::default(),
+            };
+            cat.set_print_info(&asset, &info).unwrap();
+        }
+        let query = |q: AssetQuery| rel_paths_of(&cat, q);
+        assert_eq!(
+            query(AssetQuery {
+                materials: vec!["PETG".into()],
+                ..Default::default()
+            }),
+            ["long.3mf"]
+        );
+        assert_eq!(
+            query(AssetQuery {
+                materials: vec!["PLA".into(), "ABS".into()],
+                ..Default::default()
+            }),
+            ["long.3mf", "quick.3mf"]
+        );
+        assert_eq!(
+            query(AssetQuery {
+                print_time: Some((0, Some(3_600))),
+                ..Default::default()
+            }),
+            ["quick.3mf"]
+        );
+        assert_eq!(
+            query(AssetQuery {
+                print_time: Some((4 * 3_600, None)),
+                ..Default::default()
+            }),
+            ["long.3mf"]
+        );
+        let search = |q: &str| {
+            query(AssetQuery {
+                search: Some(q.into()),
+                ..Default::default()
+            })
+        };
+        assert_eq!(search("a1 mini"), ["quick.3mf"]);
+        assert_eq!(search("ada"), ["long.3mf"]);
+        assert_eq!(search("petg"), ["long.3mf"]);
+        assert_eq!(
+            cat.all_materials().unwrap(),
+            [("PLA".to_string(), 2), ("PETG".to_string(), 1)]
+        );
     }
 
     #[test]

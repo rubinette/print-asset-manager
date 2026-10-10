@@ -10,6 +10,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::{prelude::FluentBuilder as _, *};
 use pam_core::catalog::Asset;
+use pam_core::print_info::PrintInfo;
 use pam_preview::Camera;
 
 use crate::i18n::{self, Key};
@@ -236,6 +237,10 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                     ))
                 }),
         )
+        .when_some(
+            asset.print.as_ref().filter(|p| !p.is_empty()),
+            |el, print| el.child(print_info_rows(print, &theme)),
+        )
         .child(Input::new(&this.tag_input).prefix(Icon::new(Lucide::Tag).small()))
         .child(
             v_flex()
@@ -366,6 +371,42 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
                     let ids = this.selection.clone();
                     this.confirm_trash(&ids, window, cx)
                 })),
+        )
+}
+
+/// The slicer section: whatever the 3MF says, nothing for what it doesn't.
+fn print_info_rows(print: &PrintInfo, theme: &gpui_kit::component::Theme) -> impl IntoElement {
+    let rows: Vec<(Key, String)> = [
+        (Key::Title, print.title.clone()),
+        (Key::Designer, print.designer.clone()),
+        (Key::Printer, print.printer.clone()),
+        (
+            Key::Materials,
+            (!print.materials.is_empty()).then(|| print.materials.join(", ")),
+        ),
+        (Key::PrintTime, print.print_time_s.map(i18n::duration)),
+        (Key::Filament, print.filament_g.map(|g| format!("{g:.1} g"))),
+        (
+            Key::LayerHeight,
+            print.layer_height_mm.map(|h| format!("{h:.2} mm")),
+        ),
+        (Key::Slicer, print.application.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key, value?)))
+    .collect();
+    v_flex()
+        .gap_1p5()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child(i18n::t(Key::SlicerInfo)),
+        )
+        .children(
+            rows.into_iter()
+                .map(|(key, value)| meta_row(i18n::t(key), value, theme)),
         )
 }
 

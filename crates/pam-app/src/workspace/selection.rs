@@ -229,6 +229,7 @@ mod tests {
             status: None,
             status_at: None,
             note: String::new(),
+            print: None,
         }
     }
 

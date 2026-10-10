@@ -33,7 +33,7 @@ use crate::{
 use asset_view::{
     asset_pane, card_slider_state, grid_layout, ViewMode, CARD_DEFAULT, CARD_MAX, CARD_MIN,
 };
-use filters::{filter_bar, parse_bed, Filters, SizeBucket, DEFAULT_BED};
+use filters::{filter_bar, parse_bed, Filters, PrintTimeBucket, SizeBucket, DEFAULT_BED};
 use inspector::inspector;
 use preview::PreviewMesh;
 use sidebar::{sidebar, FolderNode, Location};
@@ -74,6 +74,8 @@ pub struct Workspace {
     catalog: Arc<Catalog>,
     libraries: Vec<Library>,
     tags: Vec<(String, i64)>,
+    /// Filament types in 3MF slicer settings, with file counts.
+    materials: Vec<(String, i64)>,
     assets: Vec<Asset>,
     /// Primary selection: previewed, shown in the inspector, moved by arrows.
     selected: Option<i64>,
@@ -216,6 +218,7 @@ impl Workspace {
             catalog,
             libraries: Vec::new(),
             tags: Vec::new(),
+            materials: Vec::new(),
             assets: Vec::new(),
             selected: None,
             selection: Vec::new(),
@@ -303,6 +306,9 @@ impl Workspace {
                 .retain(|t| tags.iter().any(|(name, _)| name == t));
             self.tags = tags;
         }
+        if let Ok(materials) = self.catalog.all_materials() {
+            self.materials = materials;
+        }
         if let Ok(n) = self.catalog.duplicate_count() {
             self.duplicate_count = n;
         }
@@ -350,6 +356,8 @@ impl Workspace {
                 .map(|m| now_ns() - m.days() * 86_400 * 1_000_000_000),
             untagged: f.untagged,
             print_status: f.status,
+            materials: f.materials.clone(),
+            print_time: f.print_time.map(PrintTimeBucket::range),
             thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
             duplicates_only: self.location == Location::Duplicates,
             search: if self.search_text.trim().is_empty() {

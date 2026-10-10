@@ -127,6 +127,21 @@ pub enum Key {
     Unmarked,
     ClearStatus,
     NoteHint,
+    SlicerInfo,
+    Title,
+    Designer,
+    Printer,
+    Materials,
+    PrintTime,
+    Filament,
+    LayerHeight,
+    Slicer,
+    NoMaterialsYet,
+    AnyPrintTime,
+    PrintTimeUnder1h,
+    PrintTime1To4h,
+    PrintTime4To12h,
+    PrintTimeOver12h,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -195,6 +210,24 @@ pub fn move_n_to_trash(n: usize) -> String {
 
 pub fn selected_count(n: usize) -> String {
     selected_count_for(current(), n)
+}
+
+/// Estimated print time, e.g. "2 小時 5 分" / "2 h 5 min".
+pub fn duration(secs: u64) -> String {
+    duration_for(current(), secs)
+}
+
+fn duration_for(language: Language, secs: u64) -> String {
+    let minutes = (secs + 30) / 60;
+    let (h, m) = (minutes / 60, minutes % 60);
+    match (language, h, m) {
+        (Language::Chinese, 0, m) => format!("{m} 分"),
+        (Language::Chinese, h, 0) => format!("{h} 小時"),
+        (Language::Chinese, h, m) => format!("{h} 小時 {m} 分"),
+        (Language::English, 0, m) => format!("{m} min"),
+        (Language::English, h, 0) => format!("{h} h"),
+        (Language::English, h, m) => format!("{h} h {m} min"),
+    }
 }
 
 pub fn fits_bed(size: &str) -> String {
@@ -479,6 +512,36 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::ClearStatus) => "Clear Print Status",
         (Language::Chinese, Key::NoteHint) => "備註：參數、心得…",
         (Language::English, Key::NoteHint) => "Notes: settings, how it went…",
+        (Language::Chinese, Key::SlicerInfo) => "切片資訊",
+        (Language::English, Key::SlicerInfo) => "Slicer Info",
+        (Language::Chinese, Key::Title) => "標題",
+        (Language::English, Key::Title) => "Title",
+        (Language::Chinese, Key::Designer) => "設計者",
+        (Language::English, Key::Designer) => "Designer",
+        (Language::Chinese, Key::Printer) => "印表機",
+        (Language::English, Key::Printer) => "Printer",
+        (Language::Chinese, Key::Materials) => "材料",
+        (Language::English, Key::Materials) => "Material",
+        (Language::Chinese, Key::PrintTime) => "列印時間",
+        (Language::English, Key::PrintTime) => "Print Time",
+        (Language::Chinese, Key::Filament) => "耗材",
+        (Language::English, Key::Filament) => "Filament",
+        (Language::Chinese, Key::LayerHeight) => "層高",
+        (Language::English, Key::LayerHeight) => "Layer Height",
+        (Language::Chinese, Key::Slicer) => "切片軟體",
+        (Language::English, Key::Slicer) => "Slicer",
+        (Language::Chinese, Key::NoMaterialsYet) => "還沒有 3MF 材料資訊",
+        (Language::English, Key::NoMaterialsYet) => "No material info from 3MF files yet",
+        (Language::Chinese, Key::AnyPrintTime) => "任何時間",
+        (Language::English, Key::AnyPrintTime) => "Any Time",
+        (Language::Chinese, Key::PrintTimeUnder1h) => "1 小時內",
+        (Language::English, Key::PrintTimeUnder1h) => "Under 1 hour",
+        (Language::Chinese, Key::PrintTime1To4h) => "1–4 小時",
+        (Language::English, Key::PrintTime1To4h) => "1–4 hours",
+        (Language::Chinese, Key::PrintTime4To12h) => "4–12 小時",
+        (Language::English, Key::PrintTime4To12h) => "4–12 hours",
+        (Language::Chinese, Key::PrintTimeOver12h) => "12 小時以上",
+        (Language::English, Key::PrintTimeOver12h) => "Over 12 hours",
     }
 }
 
@@ -655,6 +718,21 @@ mod tests {
             Key::Unmarked,
             Key::ClearStatus,
             Key::NoteHint,
+            Key::SlicerInfo,
+            Key::Title,
+            Key::Designer,
+            Key::Printer,
+            Key::Materials,
+            Key::PrintTime,
+            Key::Filament,
+            Key::LayerHeight,
+            Key::Slicer,
+            Key::NoMaterialsYet,
+            Key::AnyPrintTime,
+            Key::PrintTimeUnder1h,
+            Key::PrintTime1To4h,
+            Key::PrintTime4To12h,
+            Key::PrintTimeOver12h,
         ];
         for key in KEYS {
             assert!(
@@ -666,6 +744,16 @@ mod tests {
                 "missing en for {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn durations_round_to_minutes() {
+        assert_eq!(duration_for(Language::Chinese, 7_500), "2 小時 5 分");
+        assert_eq!(duration_for(Language::Chinese, 3_599), "1 小時");
+        assert_eq!(duration_for(Language::Chinese, 29), "0 分");
+        assert_eq!(duration_for(Language::English, 2_700), "45 min");
+        assert_eq!(duration_for(Language::English, 7_200), "2 h");
+        assert_eq!(duration_for(Language::English, 5_425), "1 h 30 min");
     }
 
     #[test]

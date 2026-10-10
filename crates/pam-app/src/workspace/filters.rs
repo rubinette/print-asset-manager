@@ -49,6 +49,44 @@ impl SizeBucket {
     }
 }
 
+/// Estimated print time ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrintTimeBucket {
+    Under1h,
+    From1To4h,
+    From4To12h,
+    Over12h,
+}
+
+impl PrintTimeBucket {
+    const ALL: [Self; 4] = [
+        Self::Under1h,
+        Self::From1To4h,
+        Self::From4To12h,
+        Self::Over12h,
+    ];
+
+    /// Seconds: at least `.0`, below `.1`.
+    pub(super) fn range(self) -> (u64, Option<u64>) {
+        const HOUR: u64 = 3_600;
+        match self {
+            Self::Under1h => (0, Some(HOUR)),
+            Self::From1To4h => (HOUR, Some(4 * HOUR)),
+            Self::From4To12h => (4 * HOUR, Some(12 * HOUR)),
+            Self::Over12h => (12 * HOUR, None),
+        }
+    }
+
+    fn key(self) -> Key {
+        match self {
+            Self::Under1h => Key::PrintTimeUnder1h,
+            Self::From1To4h => Key::PrintTime1To4h,
+            Self::From4To12h => Key::PrintTime4To12h,
+            Self::Over12h => Key::PrintTimeOver12h,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ModifiedWithin {
     Week,
@@ -88,6 +126,9 @@ pub(super) struct Filters {
     pub(super) untagged: bool,
     pub(super) thumb_failed: bool,
     pub(super) status: Option<StatusFilter>,
+    /// Filament types; any of them matches.
+    pub(super) materials: Vec<String>,
+    pub(super) print_time: Option<PrintTimeBucket>,
 }
 
 impl Filters {
@@ -101,6 +142,8 @@ impl Filters {
             !self.tags.is_empty(),
             self.untagged || self.thumb_failed,
             self.status.is_some(),
+            !self.materials.is_empty(),
+            self.print_time.is_some(),
         ]
         .into_iter()
         .filter(|on| *on)
@@ -163,6 +206,14 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
     let f = this.filters.clone();
     let bed = this.bed;
     let tags: Vec<String> = this.tags.iter().map(|(name, _)| name.clone()).collect();
+    // Selected materials stay listed (so they can be unticked) even when no
+    // file has them right now, e.g. from a saved search.
+    let mut materials = this.materials.clone();
+    for name in &f.materials {
+        if !materials.iter().any(|(m, _)| m == name) {
+            materials.push((name.clone(), 0));
+        }
+    }
 
     // Menu item that applies `change` to the filters.
     fn filter_item(
@@ -206,6 +257,7 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
         " / "
     };
     let tags_label = (!f.tags.is_empty()).then(|| f.tags.join(tag_joiner));
+    let materials_label = (!f.materials.is_empty()).then(|| f.materials.join(" / "));
     let status_label = f.status.map(|s| match s {
         StatusFilter::Is(status) => i18n::t(status_key(status)).to_string(),
         StatusFilter::Unmarked => i18n::t(Key::Unmarked).to_string(),
@@ -399,6 +451,64 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
         )
         .child(
             dropdown(
+                "filter-materials",
+                titled(Key::Materials, materials_label),
+                !f.materials.is_empty(),
+            )
+            .dropdown_menu({
+                let (workspace, selected) = (workspace.clone(), f.materials.clone());
+                move |menu, _, _| {
+                    if materials.is_empty() {
+                        return menu.label(i18n::t(Key::NoMaterialsYet));
+                    }
+                    materials.iter().fold(menu, |menu, (name, count)| {
+                        let material = name.clone();
+                        menu.item(filter_item(
+                            format!("{name} ({count})"),
+                            selected.contains(name),
+                            &workspace,
+                            move |f| match f.materials.iter().position(|m| *m == material) {
+                                Some(i) => {
+                                    f.materials.remove(i);
+                                }
+                                None => f.materials.push(material.clone()),
+                            },
+                        ))
+                    })
+                }
+            }),
+        )
+        .child(
+            dropdown(
+                "filter-print-time",
+                titled(
+                    Key::PrintTime,
+                    f.print_time.map(|b| i18n::t(b.key()).to_string()),
+                ),
+                f.print_time.is_some(),
+            )
+            .dropdown_menu({
+                let (workspace, current) = (workspace.clone(), f.print_time);
+                move |menu, _, _| {
+                    let menu = menu.item(filter_item(
+                        i18n::t(Key::AnyPrintTime),
+                        current.is_none(),
+                        &workspace,
+                        |f| f.print_time = None,
+                    ));
+                    PrintTimeBucket::ALL.into_iter().fold(menu, |menu, bucket| {
+                        menu.item(filter_item(
+                            i18n::t(bucket.key()),
+                            current == Some(bucket),
+                            &workspace,
+                            move |f| f.print_time = Some(bucket),
+                        ))
+                    })
+                }
+            }),
+        )
+        .child(
+            dropdown(
                 "filter-status",
                 titled(Key::PrintStatus, status_label),
                 f.status.is_some(),
@@ -484,6 +594,17 @@ mod tests {
             assert_eq!(parse_bed(&bed_pref(bed)), Some(bed));
         }
         assert_eq!(bed_label([250.0, 210.0, 220.0]), "250×210×220");
+    }
+
+    #[::core::prelude::v1::test]
+    fn print_time_buckets_tile_the_range() {
+        use super::PrintTimeBucket;
+        let ranges = PrintTimeBucket::ALL.map(PrintTimeBucket::range);
+        assert_eq!(ranges[0].0, 0);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, Some(pair[1].0));
+        }
+        assert_eq!(ranges[3].1, None);
     }
 
     #[::core::prelude::v1::test]
