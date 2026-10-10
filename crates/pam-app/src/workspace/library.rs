@@ -139,28 +139,34 @@ impl Workspace {
         self.thumb_done = 0;
         self.thumb_total = self.catalog.pending_count().unwrap_or(0);
         let catalog = self.catalog.clone();
+        let hashed = Arc::new(AtomicU32::new(0));
         let done = Arc::new(AtomicU32::new(0));
         cx.spawn(async move |this, cx| loop {
             this.update(cx, |this, _cx| {
                 this.thumbs_wanted = false;
             })
             .ok();
-            let (catalog2, done2) = (catalog.clone(), done.clone());
+            let (catalog2, hashed2, done2) = (catalog.clone(), hashed.clone(), done.clone());
             let (done_tx, done_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                jobs::drain_pending(&catalog2, &done2);
+                jobs::drain(&catalog2, &hashed2, &done2);
                 let _ = done_tx.send(());
             });
+            // New hashes change the duplicates count, new thumbnails the grid.
+            let progress = || (hashed.load(Ordering::Relaxed), done.load(Ordering::Relaxed));
+            let mut reloaded = progress();
             let mut last_reload = Instant::now();
             loop {
                 let finished = !matches!(done_rx.try_recv(), Err(TryRecvError::Empty));
-                let n = done.load(Ordering::Relaxed);
-                let refresh = finished || last_reload.elapsed() >= THUMB_RELOAD_INTERVAL;
+                let now = progress();
+                let refresh =
+                    now != reloaded && (finished || last_reload.elapsed() >= THUMB_RELOAD_INTERVAL);
                 this.update(cx, |this, cx| {
+                    let n = now.1;
                     let progressed = this.thumb_done != n;
                     this.thumb_done = n;
                     this.thumb_total = this.thumb_total.max(n);
-                    if refresh && progressed {
+                    if refresh {
                         this.reload(cx);
                     } else if progressed {
                         cx.notify();
@@ -171,6 +177,7 @@ impl Workspace {
                     break;
                 }
                 if refresh {
+                    reloaded = now;
                     last_reload = Instant::now();
                 }
                 cx.background_executor()
