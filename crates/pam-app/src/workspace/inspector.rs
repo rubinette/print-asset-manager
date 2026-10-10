@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::{prelude::FluentBuilder as _, *};
@@ -15,6 +15,7 @@ use pam_preview::Camera;
 use crate::i18n::{self, Key};
 
 use super::format::{format_date, group_digits};
+use super::print_status::{status_buttons, status_date};
 use super::Workspace;
 
 pub(super) const INSPECTOR_WIDTH: f32 = 440.0;
@@ -66,15 +67,24 @@ pub(super) fn inspector(this: &Workspace, cx: &mut Context<Workspace>) -> impl I
         .border_color(theme.border)
         .bg(theme.sidebar)
         .child(preview_pane(this, cx))
-        .map(|el| {
-            if this.selection.len() > 1 {
-                el.child(batch_details(this, cx))
-            } else if let Some(asset) = this.selected_asset() {
-                el.child(asset_details(this, asset, cx))
-            } else {
-                el
-            }
-        })
+        .child(
+            // Scrolls once the details outgrow their share; the preview keeps
+            // the rest (at least its minimum height).
+            div()
+                .id("inspector-details")
+                .min_h_0()
+                .max_h(relative(0.62))
+                .overflow_y_scroll()
+                .map(|el| {
+                    if this.selection.len() > 1 {
+                        el.child(batch_details(this, cx))
+                    } else if let Some(asset) = this.selected_asset() {
+                        el.child(asset_details(this, asset, cx))
+                    } else {
+                        el
+                    }
+                }),
+        )
 }
 
 fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
@@ -228,6 +238,22 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
         )
         .child(Input::new(&this.tag_input).prefix(Icon::new(Lucide::Tag).small()))
         .child(
+            v_flex()
+                .gap_1p5()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t(Key::PrintStatus))
+                        .when_some(status_date(asset), |el, date| {
+                            el.child(div().text_xs().child(date))
+                        }),
+                )
+                .child(status_buttons("status", asset.status, vec![asset.id], cx)),
+        )
+        .child(Textarea::new(&this.note_input))
+        .child(
             h_flex()
                 .gap_2()
                 .child(
@@ -271,6 +297,16 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
         }
     }
     let total = this.selection.len();
+    // Highlight a status only when every selected asset has it.
+    let mut statuses = this
+        .assets
+        .iter()
+        .filter(|a| selection.contains(&a.id))
+        .map(|a| a.status);
+    let common_status = statuses
+        .next()
+        .flatten()
+        .filter(|first| statuses.all(|s| s == Some(*first)));
     v_flex()
         .flex_shrink_0()
         .px_4()
@@ -315,6 +351,12 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
                     })),
             )
         })
+        .child(status_buttons(
+            "batch-status",
+            common_status,
+            this.selection.clone(),
+            cx,
+        ))
         .child(
             Button::new("trash-selection")
                 .outline()

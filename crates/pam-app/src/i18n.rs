@@ -119,6 +119,14 @@ pub enum Key {
     RemoveTag,
     RegenerateThumbs,
     TrashDetailMany,
+    PrintStatus,
+    StatusTodo,
+    StatusPrinted,
+    StatusFailed,
+    AnyStatus,
+    Unmarked,
+    ClearStatus,
+    NoteHint,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -455,6 +463,22 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::RegenerateThumbs) => "Regenerate Thumbnails",
         (Language::Chinese, Key::TrashDetailMany) => "原始檔案會移到系統垃圾桶，可從垃圾桶復原。",
         (Language::English, Key::TrashDetailMany) => "The original files will be moved to the system Trash, where you can restore them.",
+        (Language::Chinese, Key::PrintStatus) => "列印狀態",
+        (Language::English, Key::PrintStatus) => "Print Status",
+        (Language::Chinese, Key::StatusTodo) => "待印",
+        (Language::English, Key::StatusTodo) => "To Print",
+        (Language::Chinese, Key::StatusPrinted) => "已印",
+        (Language::English, Key::StatusPrinted) => "Printed",
+        (Language::Chinese, Key::StatusFailed) => "失敗",
+        (Language::English, Key::StatusFailed) => "Failed",
+        (Language::Chinese, Key::AnyStatus) => "任何狀態",
+        (Language::English, Key::AnyStatus) => "Any Status",
+        (Language::Chinese, Key::Unmarked) => "未標記",
+        (Language::English, Key::Unmarked) => "Not Marked",
+        (Language::Chinese, Key::ClearStatus) => "清除列印狀態",
+        (Language::English, Key::ClearStatus) => "Clear Print Status",
+        (Language::Chinese, Key::NoteHint) => "備註：參數、心得…",
+        (Language::English, Key::NoteHint) => "Notes: settings, how it went…",
     }
 }
 
@@ -623,6 +647,14 @@ mod tests {
             Key::RemoveTag,
             Key::RegenerateThumbs,
             Key::TrashDetailMany,
+            Key::PrintStatus,
+            Key::StatusTodo,
+            Key::StatusPrinted,
+            Key::StatusFailed,
+            Key::AnyStatus,
+            Key::Unmarked,
+            Key::ClearStatus,
+            Key::NoteHint,
         ];
         for key in KEYS {
             assert!(

@@ -172,7 +172,8 @@ impl Workspace {
         if let Some(old) = self.preview_image.take() {
             cx.drop_image(old, None);
         }
-        if let Some(asset) = self.assets.iter().find(|a| a.id == id) {
+        let asset = self.assets.iter().find(|a| a.id == id).cloned();
+        if let Some(asset) = &asset {
             let tags = asset.tags.join(", ");
             self.tag_input.update(cx, |input, cx| {
                 input.set_value(tags, window, cx);
@@ -181,6 +182,7 @@ impl Workspace {
                 self.preview_image = Some(thumb);
             }
         }
+        self.load_note(asset.as_ref(), window, cx);
         self.render_preview(cx);
         cx.notify();
     }
@@ -224,6 +226,9 @@ mod tests {
             thumb_state: pam_core::catalog::ThumbState::Pending,
             error: None,
             tags: Vec::new(),
+            status: None,
+            status_at: None,
+            note: String::new(),
         }
     }
 

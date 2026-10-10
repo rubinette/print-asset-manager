@@ -4,6 +4,7 @@ mod format;
 mod inspector;
 mod library;
 mod preview;
+mod print_status;
 mod removal;
 mod selection;
 mod sidebar;
@@ -13,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Root, TitleBar};
 use gpui_kit::{prelude::FluentBuilder as _, Focusable as _, *};
@@ -96,6 +97,10 @@ pub struct Workspace {
     tag_input: Entity<InputState>,
     /// Inspector input that adds tags to every selected asset.
     batch_tag_input: Entity<InputState>,
+    note_input: Entity<TextareaState>,
+    /// Asset whose note `note_input` holds, and the note as last saved.
+    note_asset: Option<(i64, String)>,
+    note_generation: u64,
     search_text: String,
     search_generation: u64,
     sort: AssetSort,
@@ -142,6 +147,7 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::TagsHint)));
         let batch_tag_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::AddTagsHint)));
+        let note_input = cx.new(|cx| print_status::new_note_input(window, cx));
 
         let card_size = read_pref("card_size")
             .and_then(|raw| raw.trim().parse::<f32>().ok())
@@ -189,6 +195,15 @@ impl Workspace {
                 }
             },
         ));
+        subs.push(cx.subscribe_in(
+            &note_input,
+            window,
+            |this, _, event, _window, cx| match event {
+                InputEvent::Change => this.schedule_note_save(cx),
+                InputEvent::Blur => this.save_note(cx),
+                _ => {}
+            },
+        ));
         subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             apply_system_theme(Some(window), cx);
             if this.selected.is_some() {
@@ -218,6 +233,9 @@ impl Workspace {
             search,
             tag_input,
             batch_tag_input,
+            note_input,
+            note_asset: None,
+            note_generation: 0,
             search_text: String::new(),
             search_generation: 0,
             sort: read_pref("sort")
@@ -267,6 +285,9 @@ impl Workspace {
         });
         self.batch_tag_input.update(cx, |input, cx| {
             input.set_placeholder(i18n::t(Key::AddTagsHint), window, cx);
+        });
+        self.note_input.update(cx, |input, cx| {
+            input.set_placeholder(i18n::t(Key::NoteHint), window, cx);
         });
         cx.notify();
     }
@@ -328,6 +349,7 @@ impl Workspace {
                 .modified
                 .map(|m| now_ns() - m.days() * 86_400 * 1_000_000_000),
             untagged: f.untagged,
+            print_status: f.status,
             thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
             duplicates_only: self.location == Location::Duplicates,
             search: if self.search_text.trim().is_empty() {
@@ -389,6 +411,11 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         (self.grid_cols, self.grid_card_width) =
             grid_layout(window.viewport_size().width.as_f32(), self.card_size);
+        if self.note_asset.as_ref().map(|(id, _)| *id) != self.selected {
+            cx.defer_in(window, |this, window, cx| {
+                this.sync_inspector_inputs(window, cx)
+            });
+        }
         v_flex()
             .size_full()
             .bg(theme.background)

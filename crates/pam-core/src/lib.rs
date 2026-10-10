@@ -7,7 +7,10 @@ pub mod open;
 pub mod paths;
 pub mod watch;
 
-pub use catalog::{Asset, AssetQuery, AssetSort, Catalog, Library, ScanStats, ThumbState};
+pub use catalog::{
+    Asset, AssetQuery, AssetSort, Catalog, Library, PrintStatus, ScanStats, StatusFilter,
+    ThumbState,
+};
 pub use error::{Error, Result};
 pub use load::{extract_3mf_thumbnail, load_mesh};
 pub use mesh::{AssetFormat, BBox, Mesh};

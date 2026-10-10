@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS asset_tags (
   PRIMARY KEY (asset_id, tag_id)
 );
 
+-- Print status and note per asset. Its own table rather than assets columns:
+-- there are no migrations, and CREATE TABLE IF NOT EXISTS reaches catalogs
+-- made before it existed. A row is dropped once both are cleared.
+CREATE TABLE IF NOT EXISTS asset_notes (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+  status TEXT,
+  status_at INTEGER,
+  note TEXT NOT NULL DEFAULT ''
+);
+
 -- User data (tags, ...) of files that left the index, keyed by content hash,
 -- as JSON. A file moved to another library gets it back once it is hashed
 -- there. Moves inside one library keep their row instead (`relink_moved`).
@@ -107,6 +117,43 @@ impl ThumbState {
     }
 }
 
+/// Where an asset stands in the user's printing, set by hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrintStatus {
+    Todo,
+    Printed,
+    Failed,
+}
+
+impl PrintStatus {
+    pub const ALL: [Self; 3] = [Self::Todo, Self::Printed, Self::Failed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Printed => "printed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "todo" => Some(Self::Todo),
+            "printed" => Some(Self::Printed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// [`AssetQuery::print_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusFilter {
+    Is(PrintStatus),
+    /// No print status set.
+    Unmarked,
+}
+
 #[derive(Clone, Debug)]
 pub struct Asset {
     pub id: i64,
@@ -122,6 +169,11 @@ pub struct Asset {
     pub thumb_state: ThumbState,
     pub error: Option<String>,
     pub tags: Vec<String>,
+    pub status: Option<PrintStatus>,
+    /// Unix seconds when `status` was last set.
+    pub status_at: Option<i64>,
+    /// Free text; empty when there is none.
+    pub note: String,
 }
 
 impl Asset {
@@ -293,6 +345,7 @@ pub struct AssetQuery {
     pub file_size: Option<(u64, Option<u64>)>,
     pub modified_since_ns: Option<i64>,
     pub untagged: bool,
+    pub print_status: Option<StatusFilter>,
     /// Only assets whose content hash is shared with another asset.
     pub duplicates_only: bool,
     pub search: Option<String>,
@@ -542,6 +595,16 @@ impl Catalog {
         if query.untagged {
             sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
         }
+        match query.print_status {
+            Some(StatusFilter::Is(status)) => {
+                sql.push_str(" AND a.id IN (SELECT asset_id FROM asset_notes WHERE status = ?)");
+                args.push(status.as_str().to_string().into());
+            }
+            Some(StatusFilter::Unmarked) => sql.push_str(
+                " AND a.id NOT IN (SELECT asset_id FROM asset_notes WHERE status IS NOT NULL)",
+            ),
+            None => {}
+        }
         if !query.formats.is_empty() {
             sql.push_str(&format!(
                 " AND a.format IN ({})",
@@ -588,9 +651,12 @@ impl Catalog {
                         JOIN tags t ON t.id = at.tag_id
                         WHERE t.name LIKE ? ESCAPE '\\'
                       ) OR a.id IN (
+                        SELECT asset_id FROM asset_notes WHERE note LIKE ? ESCAPE '\\'
+                      ) OR a.id IN (
                         SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
                       ))",
                 );
+                args.push(like.clone().into());
                 args.push(like.clone().into());
                 args.push(like.into());
                 args.push(fts_query(&search).into());
@@ -862,6 +928,38 @@ impl Catalog {
         Ok(())
     }
 
+    /// Set (or with `None` clear) the print status of every asset in `ids`.
+    pub fn set_status(&self, ids: &[i64], status: Option<PrintStatus>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = now_secs();
+        for &id in ids {
+            tx.execute(
+                "INSERT INTO asset_notes (asset_id, status, status_at)
+                 SELECT id, ?2, ?3 FROM assets WHERE id = ?1
+                 ON CONFLICT (asset_id) DO UPDATE
+                   SET status = excluded.status, status_at = excluded.status_at",
+                params![id, status.map(PrintStatus::as_str), status.map(|_| now)],
+            )?;
+            drop_empty_notes(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace an asset's note. A blank note clears it.
+    pub fn set_note(&self, id: i64, note: &str) -> Result<()> {
+        let note = if note.trim().is_empty() { "" } else { note };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO asset_notes (asset_id, note) SELECT id, ?2 FROM assets WHERE id = ?1
+             ON CONFLICT (asset_id) DO UPDATE SET note = excluded.note",
+            params![id, note],
+        )?;
+        drop_empty_notes(&conn, id)?;
+        Ok(())
+    }
+
     /// Relative paths of every asset in a library, for building its folder tree.
     pub fn rel_paths(&self, library_id: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
@@ -900,9 +998,10 @@ const SELECT_ASSETS: &str = "SELECT a.id, a.library_id, l.root_path, a.rel_path,
         a.size_bytes, a.mtime_ns, a.content_sha256, a.triangle_count,
         a.bbox_min_x, a.bbox_min_y, a.bbox_min_z,
         a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
-        a.thumb_state, a.error
+        a.thumb_state, a.error, n.status, n.status_at, COALESCE(n.note, '')
  FROM assets a
- JOIN libraries l ON l.id = a.library_id";
+ JOIN libraries l ON l.id = a.library_id
+ LEFT JOIN asset_notes n ON n.asset_id = a.id";
 
 /// An [`Asset`] from a [`SELECT_ASSETS`] row, without its tags.
 fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
@@ -935,7 +1034,22 @@ fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
         thumb_state: ThumbState::parse(&r.get::<_, String>(15)?),
         error: r.get(16)?,
         tags: Vec::new(),
+        status: r
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(PrintStatus::parse),
+        status_at: r.get(18)?,
+        note: r.get(19)?,
     })
+}
+
+/// Drop an asset's `asset_notes` row once it holds neither status nor note.
+fn drop_empty_notes(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM asset_notes WHERE asset_id = ?1 AND status IS NULL AND note = ''",
+        params![id],
+    )?;
+    Ok(())
 }
 
 /// Attach one tag (created if new) to an asset. Blank names are ignored.
@@ -1164,11 +1278,14 @@ fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<()> {
             "INSERT OR REPLACE INTO detached_meta (content_sha256, data, detached_at)
              SELECT a.content_sha256, json_object(
                  'tags', json((SELECT json_group_array(t.name) FROM asset_tags at
-                               JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = a.id))
+                               JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = a.id)),
+                 'status', n.status, 'status_at', n.status_at, 'note', n.note
                ), ?2
              FROM assets a
+             LEFT JOIN asset_notes n ON n.asset_id = a.id
              WHERE ({condition}) AND a.content_sha256 IS NOT NULL
-               AND EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)"
+               AND (n.asset_id IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id))"
         ),
         params![arg, now_secs()],
     )?;
@@ -1190,7 +1307,8 @@ fn reattach_user_data(conn: &Connection, id: i64, sha: &[u8]) -> Result<()> {
         return Ok(());
     };
     let has_own: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = ?1)",
+        "SELECT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = ?1)
+             OR EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = ?1)",
         params![id],
         |r| r.get(0),
     )?;
@@ -1203,6 +1321,13 @@ fn reattach_user_data(conn: &Connection, id: i64, sha: &[u8]) -> Result<()> {
             insert_asset_tag(conn, id, tag)?;
         }
         refresh_fts(conn, id)?;
+        conn.execute(
+            "INSERT INTO asset_notes (asset_id, status, status_at, note)
+             SELECT ?1, json_extract(?2, '$.status'), json_extract(?2, '$.status_at'),
+                    COALESCE(json_extract(?2, '$.note'), '')",
+            params![id, data],
+        )?;
+        drop_empty_notes(conn, id)?;
     }
     conn.execute(
         "DELETE FROM detached_meta WHERE content_sha256 = ?1",
@@ -2338,6 +2463,101 @@ mod tests {
         let mine = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
         cat.hash_asset(&mine).unwrap();
         assert_eq!(tags_of(&cat, "x.stl"), ["mine"]);
+    }
+
+    #[test]
+    fn print_status_and_notes_filter_search_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "c.stl"]);
+        let with_status = |filter| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    print_status: Some(filter),
+                    ..Default::default()
+                },
+            )
+        };
+        cat.set_status(&[ids["a.stl"], ids["b.stl"]], Some(PrintStatus::Todo))
+            .unwrap();
+        cat.set_status(&[ids["b.stl"], 9_999], Some(PrintStatus::Printed))
+            .unwrap();
+        cat.set_note(ids["c.stl"], "0.12mm 層高，支撐要開").unwrap();
+        assert_eq!(with_status(StatusFilter::Is(PrintStatus::Todo)), ["a.stl"]);
+        assert_eq!(
+            with_status(StatusFilter::Is(PrintStatus::Printed)),
+            ["b.stl"]
+        );
+        assert_eq!(with_status(StatusFilter::Unmarked), ["c.stl"]);
+
+        let assets = cat.assets(&AssetQuery::default()).unwrap();
+        let b = assets.iter().find(|a| a.rel_path == "b.stl").unwrap();
+        assert_eq!(b.status, Some(PrintStatus::Printed));
+        assert!(b.status_at.unwrap() > 0);
+        let c = assets.iter().find(|a| a.rel_path == "c.stl").unwrap();
+        assert_eq!((c.status, c.note.as_str()), (None, "0.12mm 層高，支撐要開"));
+
+        let found = rel_paths_of(
+            &cat,
+            AssetQuery {
+                search: Some("支撐".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(found, ["c.stl"]);
+
+        let rows = |cat: &Catalog| -> i64 {
+            cat.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM asset_notes", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows(&cat), 3);
+        cat.set_status(&[ids["a.stl"]], None).unwrap();
+        cat.set_note(ids["c.stl"], "  \n").unwrap();
+        assert_eq!(rows(&cat), 1, "cleared rows are dropped");
+        assert_eq!(with_status(StatusFilter::Unmarked), ["a.stl", "c.stl"]);
+    }
+
+    #[test]
+    fn print_status_and_note_follow_moves() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (cat, lib_a, ids) = catalog_with(a.path(), &["x.stl", "y.stl"]);
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.set_status(&[ids["x.stl"]], Some(PrintStatus::Failed))
+            .unwrap();
+        cat.set_note(ids["x.stl"], "warped").unwrap();
+        let y = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "y.stl")
+            .unwrap();
+        cat.set_note(y.id, "elsewhere").unwrap();
+        cat.hash_asset(&y).unwrap();
+
+        // Renamed in place: same row.
+        fs::rename(a.path().join("x.stl"), a.path().join("x2.stl")).unwrap();
+        // Moved to another library: through the stash.
+        fs::rename(a.path().join("y.stl"), b.path().join("y.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        let find = |rel: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|x| x.rel_path == rel)
+                .unwrap()
+        };
+        let x2 = find("x2.stl");
+        assert_eq!(
+            (x2.status, x2.note.as_str()),
+            (Some(PrintStatus::Failed), "warped")
+        );
+        cat.hash_asset(&find("y.stl")).unwrap();
+        assert_eq!(find("y.stl").note, "elsewhere");
     }
 
     #[test]

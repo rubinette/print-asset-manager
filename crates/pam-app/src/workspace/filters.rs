@@ -4,11 +4,12 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{h_flex, ActiveTheme, Disableable as _, Sizable as _};
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use pam_core::catalog::TagMode;
+use pam_core::catalog::{PrintStatus, StatusFilter, TagMode};
 use pam_core::mesh::AssetFormat;
 
 use crate::i18n::{self, Key};
 
+use super::print_status::status_key;
 use super::{write_pref, Workspace};
 
 /// File size ranges in MB.
@@ -86,6 +87,7 @@ pub(super) struct Filters {
     pub(super) tag_mode: TagMode,
     pub(super) untagged: bool,
     pub(super) thumb_failed: bool,
+    pub(super) status: Option<StatusFilter>,
 }
 
 impl Filters {
@@ -98,6 +100,7 @@ impl Filters {
             self.modified.is_some(),
             !self.tags.is_empty(),
             self.untagged || self.thumb_failed,
+            self.status.is_some(),
         ]
         .into_iter()
         .filter(|on| *on)
@@ -203,6 +206,10 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
         " / "
     };
     let tags_label = (!f.tags.is_empty()).then(|| f.tags.join(tag_joiner));
+    let status_label = f.status.map(|s| match s {
+        StatusFilter::Is(status) => i18n::t(status_key(status)).to_string(),
+        StatusFilter::Unmarked => i18n::t(Key::Unmarked).to_string(),
+    });
     let more_label = {
         let parts: Vec<&str> = [
             f.untagged.then(|| i18n::t(Key::Untagged)),
@@ -392,6 +399,40 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
         )
         .child(
             dropdown(
+                "filter-status",
+                titled(Key::PrintStatus, status_label),
+                f.status.is_some(),
+            )
+            .dropdown_menu({
+                let (workspace, current) = (workspace.clone(), f.status);
+                move |menu, _, _| {
+                    let menu = menu.item(filter_item(
+                        i18n::t(Key::AnyStatus),
+                        current.is_none(),
+                        &workspace,
+                        |f| f.status = None,
+                    ));
+                    PrintStatus::ALL
+                        .map(StatusFilter::Is)
+                        .into_iter()
+                        .chain([StatusFilter::Unmarked])
+                        .fold(menu, |menu, filter| {
+                            let label = match filter {
+                                StatusFilter::Is(status) => i18n::t(status_key(status)),
+                                StatusFilter::Unmarked => i18n::t(Key::Unmarked),
+                            };
+                            menu.item(filter_item(
+                                label,
+                                current == Some(filter),
+                                &workspace,
+                                move |f| f.status = Some(filter),
+                            ))
+                        })
+                }
+            }),
+        )
+        .child(
+            dropdown(
                 "filter-more",
                 titled(Key::MoreFilters, more_label),
                 f.untagged || f.thumb_failed,
@@ -454,9 +495,10 @@ mod tests {
             file_size: Some(SizeBucket::Over100),
             untagged: true,
             thumb_failed: true,
+            status: Some(pam_core::catalog::StatusFilter::Unmarked),
             ..Default::default()
         };
-        assert_eq!(f.active_count(), 3);
+        assert_eq!(f.active_count(), 4);
         // Buckets tile the size range without gaps.
         let ranges = SizeBucket::ALL.map(SizeBucket::range);
         assert_eq!(ranges[0].0, 0);
