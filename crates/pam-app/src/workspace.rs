@@ -405,9 +405,9 @@ impl Render for Workspace {
                 let ids = this.selection.clone();
                 this.confirm_trash(&ids, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleFavorite, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleFavorite, window, cx| {
                 let ids = this.selection.clone();
-                this.toggle_favorite(&ids, cx);
+                this.toggle_favorite(&ids, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 window.focus(&this.search.read(cx).focus_handle(cx), cx);

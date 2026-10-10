@@ -146,7 +146,12 @@ impl Workspace {
     /// select whatever now sits at `index` (so repeated deletes keep flowing),
     /// or clear the preview when nothing is left. `reload` alone would swap
     /// the id without refreshing the preview and tag input.
-    fn reload_after_removal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn reload_after_removal(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.selected;
         self.reload(cx);
         let Some(previous) = previous else {

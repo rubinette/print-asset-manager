@@ -253,9 +253,9 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                         } else {
                             Key::AddToFavorites
                         }))
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.toggle_favorite(&[id], cx)),
-                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_favorite(&[id], window, cx)
+                        }))
                 })
                 .child(
                     Button::new("reveal")
@@ -348,9 +348,9 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
                 } else {
                     Key::AddToFavorites
                 }))
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
                     let ids = this.selection.clone();
-                    this.toggle_favorite(&ids, cx)
+                    this.toggle_favorite(&ids, window, cx)
                 }))
         })
         .child(

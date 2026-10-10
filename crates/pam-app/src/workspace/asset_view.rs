@@ -306,8 +306,10 @@ fn asset_menu(
         } else {
             Lucide::Star
         }))
-        .on_click(move |_, _, cx| {
-            let _ = workspace.update(cx, |this, cx| this.toggle_favorite(&favorite_targets, cx));
+        .on_click(move |_, window, cx| {
+            let _ = workspace.update(cx, |this, cx| {
+                this.toggle_favorite(&favorite_targets, window, cx)
+            });
         })
     })
     .item({

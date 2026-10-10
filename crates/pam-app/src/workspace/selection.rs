@@ -121,15 +121,23 @@ impl Workspace {
     }
 
     /// Unstar `ids` if they are all starred, otherwise star them all.
-    pub(super) fn toggle_favorite(&mut self, ids: &[i64], cx: &mut Context<Self>) {
+    pub(super) fn toggle_favorite(
+        &mut self,
+        ids: &[i64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if ids.is_empty() {
             return;
         }
         let favorite = !self.all_favorite(ids);
+        let index = self.selected_index().unwrap_or(0);
         if let Err(err) = self.catalog.set_favorite(ids, favorite) {
             eprintln!("set favorite failed: {err}");
         }
-        self.reload(cx);
+        // Unstarring in the favorites view drops the rows, possibly the
+        // selected one, so refresh the preview and tag input like a removal.
+        self.reload_after_removal(index, window, cx);
     }
 
     /// Select only `id`.
