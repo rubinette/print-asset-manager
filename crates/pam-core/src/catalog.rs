@@ -459,6 +459,8 @@ impl Catalog {
     pub fn remove_library(&self, id: i64) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // Unlike a vanished file, nothing moved: the stash waits for this
+        // folder to come back rather than going to a copy elsewhere.
         stash_user_data(&tx, "a.library_id = ?1", id)?;
         // assets_fts is contentless and not covered by the FK cascade.
         tx.execute(
@@ -590,12 +592,14 @@ impl Catalog {
                 stats.moved += 1;
             }
         }
+        let mut stashed = Vec::new();
         for file in gone.iter().filter(|g| !moved.contains(&g.id)) {
-            stash_user_data(&tx, "a.id = ?1", file.id)?;
+            stashed.extend(stash_user_data(&tx, "a.id = ?1", file.id)?);
             let _ = tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![file.id]);
             tx.execute("DELETE FROM assets WHERE id = ?1", params![file.id])?;
             stats.removed += 1;
         }
+        reattach_to_indexed_copy(&tx, &stashed)?;
         tx.commit()?;
         Ok(stats)
     }
@@ -1492,10 +1496,10 @@ fn relink_moved(conn: &Connection, old_id: i64, new_id: i64) -> Result<bool> {
 /// Keep aside the user data of the assets matching `condition` (SQL on
 /// `assets a`, with `?1` bound to `arg`) before they leave the index, keyed
 /// by content hash. Assets without a hash or without user data are skipped.
-fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<()> {
-    conn.execute(
-        &format!(
-            "INSERT OR REPLACE INTO detached_meta (content_sha256, data, detached_at)
+/// Returns the hashes stashed.
+fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<Vec<Vec<u8>>> {
+    let mut stmt = conn.prepare(&format!(
+        "INSERT OR REPLACE INTO detached_meta (content_sha256, data, detached_at)
              SELECT a.content_sha256, json_object(
                  'tags', json((SELECT json_group_array(t.name) FROM asset_tags at
                                JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = a.id)),
@@ -1505,10 +1509,36 @@ fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<()> {
              LEFT JOIN asset_notes n ON n.asset_id = a.id
              WHERE ({condition}) AND a.content_sha256 IS NOT NULL
                AND (n.asset_id IS NOT NULL
-                    OR EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id))"
-        ),
-        params![arg, now_secs()],
-    )?;
+                    OR EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id))
+             RETURNING content_sha256"
+    ))?;
+    let shas = stmt
+        .query_map(params![arg, now_secs()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(shas)
+}
+
+/// Give the stashes for `shas` to a copy that is already indexed and hashed:
+/// a file moved into a library that was scanned and hashed before the
+/// original's library noticed it was gone, so `hash_asset` won't see it
+/// again. The newest copy without user data of its own gets it.
+fn reattach_to_indexed_copy(conn: &Connection, shas: &[Vec<u8>]) -> Result<()> {
+    for sha in shas {
+        let copy: Option<i64> = conn
+            .query_row(
+                "SELECT a.id FROM assets a
+                 WHERE a.content_sha256 = ?1
+                   AND NOT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = a.id)
+                   AND NOT EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = a.id)
+                 ORDER BY a.id DESC LIMIT 1",
+                params![sha],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = copy {
+            reattach_user_data(conn, id, sha)?;
+        }
+    }
     Ok(())
 }
 
@@ -2637,6 +2667,49 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn tags_reach_a_copy_hashed_before_the_original_left() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("boat.stl"), "solid boat\nendsolid boat\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let boat = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&boat).unwrap();
+        cat.set_tags(boat.id, &["boat".into()]).unwrap();
+        cat.set_status(&[boat.id], Some(PrintStatus::Printed))
+            .unwrap();
+
+        // Copy-then-delete across volumes: the copy is scanned and hashed
+        // before the source library sees the original go.
+        fs::copy(a.path().join("boat.stl"), b.path().join("moved.stl")).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        let moved = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "moved.stl")
+            .unwrap();
+        cat.hash_asset(&moved).unwrap();
+        assert!(tags_of(&cat, "moved.stl").is_empty());
+
+        fs::remove_file(a.path().join("boat.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let moved = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        assert_eq!(moved.rel_path, "moved.stl");
+        assert_eq!(moved.tags, ["boat"]);
+        assert_eq!(moved.status, Some(PrintStatus::Printed));
+        let stashes: i64 = cat
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM detached_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stashes, 0);
     }
 
     #[test]

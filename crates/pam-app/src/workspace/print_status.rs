@@ -167,6 +167,11 @@ impl Workspace {
         if let Some(asset) = self.assets.iter_mut().find(|a| a.id == id) {
             asset.note = text;
         }
+        // Search covers notes, so saved-search counts can change. The list
+        // itself waits for the next reload: re-querying here could drop the
+        // asset being typed into from under the cursor.
+        self.reload_saved();
+        cx.notify();
     }
 }
 
