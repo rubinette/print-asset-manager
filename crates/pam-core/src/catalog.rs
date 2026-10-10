@@ -577,7 +577,7 @@ impl Catalog {
                 }),
                 _ => None,
             };
-            let format = AssetFormat::from_str(&r.get::<_, String>(4)?).unwrap_or(AssetFormat::Stl);
+            let format = AssetFormat::parse(&r.get::<_, String>(4)?).unwrap_or(AssetFormat::Stl);
             out.push(Asset {
                 id,
                 library_id: r.get(1)?,

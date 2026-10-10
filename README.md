@@ -6,7 +6,7 @@
 
 ## 需求
 
-- Rust 1.85+
+- Rust 1.95+
 - macOS：Xcode Command Line Tools（Metal）
 - Linux：`libxkbcommon`、Vulkan 或 OpenGL 驅動、以及 Wayland 或 X11 開發套件
 

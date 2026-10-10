@@ -27,7 +27,8 @@ impl AssetFormat {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Inverse of [`Self::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "stl" => Some(Self::Stl),
             "obj" => Some(Self::Obj),
@@ -60,9 +61,9 @@ impl BBox {
     }
 
     pub fn include(&mut self, p: [f32; 3]) {
-        for i in 0..3 {
-            self.min[i] = self.min[i].min(p[i]);
-            self.max[i] = self.max[i].max(p[i]);
+        for (i, v) in p.into_iter().enumerate() {
+            self.min[i] = self.min[i].min(v);
+            self.max[i] = self.max[i].max(v);
         }
     }
 
@@ -265,8 +266,8 @@ mod tests {
             Some(AssetFormat::ThreeMf)
         );
         assert_eq!(AssetFormat::from_path(Path::new("a.txt")), None);
-        assert_eq!(AssetFormat::from_str("threemf"), Some(AssetFormat::ThreeMf));
-        assert_eq!(AssetFormat::from_str("nope"), None);
+        assert_eq!(AssetFormat::parse("threemf"), Some(AssetFormat::ThreeMf));
+        assert_eq!(AssetFormat::parse("nope"), None);
         assert_eq!(AssetFormat::Stl.as_str(), "stl");
         assert_eq!(AssetFormat::Obj.label(), "OBJ");
         assert_eq!(AssetFormat::ThreeMf.label(), "3MF");
