@@ -128,6 +128,13 @@ impl Asset {
             .as_ref()
             .map(|b| crate::paths::hex_sha256(b))
     }
+
+    /// Whether the file on disk still has the size and mtime this row was
+    /// read with, the same test a scan uses to skip unchanged files.
+    pub fn unchanged_on_disk(&self) -> bool {
+        std::fs::metadata(self.abs_path())
+            .is_ok_and(|meta| meta.len() == self.size_bytes && mtime_ns(&meta) == self.mtime_ns)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -447,16 +454,7 @@ impl Catalog {
             None
         };
         let conn = self.conn.lock().unwrap();
-        let mut sql = String::from(
-            "SELECT a.id, a.library_id, l.root_path, a.rel_path, a.format, a.size_bytes, a.mtime_ns,
-                    a.content_sha256, a.triangle_count,
-                    a.bbox_min_x, a.bbox_min_y, a.bbox_min_z,
-                    a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
-                    a.thumb_state, a.error
-             FROM assets a
-             JOIN libraries l ON l.id = a.library_id
-             WHERE 1=1",
-        );
+        let mut sql = format!("{SELECT_ASSETS} WHERE 1=1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(id) = query.library_id {
             sql.push_str(" AND a.library_id = ?");
@@ -562,37 +560,7 @@ impl Catalog {
         let mut rows = stmt.query(params_ref.as_slice())?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            let id: i64 = r.get(0)?;
-            let bbox = match (
-                r.get::<_, Option<f32>>(9)?,
-                r.get::<_, Option<f32>>(10)?,
-                r.get::<_, Option<f32>>(11)?,
-                r.get::<_, Option<f32>>(12)?,
-                r.get::<_, Option<f32>>(13)?,
-                r.get::<_, Option<f32>>(14)?,
-            ) {
-                (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some(BBox {
-                    min: [a, b, c],
-                    max: [d, e, f],
-                }),
-                _ => None,
-            };
-            let format = AssetFormat::from_str(&r.get::<_, String>(4)?).unwrap_or(AssetFormat::Stl);
-            out.push(Asset {
-                id,
-                library_id: r.get(1)?,
-                root_path: PathBuf::from(r.get::<_, String>(2)?),
-                rel_path: r.get(3)?,
-                format,
-                size_bytes: r.get::<_, i64>(5)? as u64,
-                mtime_ns: r.get(6)?,
-                content_sha256: r.get(7)?,
-                triangle_count: r.get(8)?,
-                bbox,
-                thumb_state: ThumbState::parse(&r.get::<_, String>(15)?),
-                error: r.get(16)?,
-                tags: Vec::new(),
-            });
+            out.push(asset_from_row(r)?);
         }
         drop(rows);
         drop(stmt);
@@ -656,6 +624,25 @@ impl Catalog {
         );
         let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(online), |r| r.get(0))?;
         Ok(n as u32)
+    }
+
+    /// Up to `limit` assets without a content hash, in online libraries, in
+    /// id order after `after_id`. Paging by id lets the hashing pass walk the
+    /// table once, so a file it can't read is not fetched again and again.
+    pub fn unhashed_assets(&self, after_id: i64, limit: usize) -> Result<Vec<Asset>> {
+        let online = self.online_library_ids()?;
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "{SELECT_ASSETS} WHERE a.content_sha256 IS NULL AND a.id > ?
+               AND a.library_id IN ({}) ORDER BY a.id LIMIT ?",
+            placeholders(online.len())
+        );
+        let mut args: Vec<rusqlite::types::Value> = vec![after_id.into()];
+        args.extend(online.into_iter().map(Into::into));
+        args.push((limit as i64).into());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), asset_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Queue every app-rendered (`ready`) thumbnail again and retry `failed`
@@ -739,12 +726,15 @@ impl Catalog {
         Ok(())
     }
 
+    /// Hash `asset`'s file and store the hash, unless a scan has seen the file
+    /// change since `asset` was read: the row then has a new size or mtime,
+    /// and a hash of the old contents must not land on it.
     pub fn hash_asset(&self, asset: &Asset) -> Result<Vec<u8>> {
         let sha = file_sha256(&asset.abs_path())?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE assets SET content_sha256=?1 WHERE id=?2",
-            params![&sha[..], asset.id],
+            "UPDATE assets SET content_sha256=?1 WHERE id=?2 AND size_bytes=?3 AND mtime_ns=?4",
+            params![&sha[..], asset.id, asset.size_bytes as i64, asset.mtime_ns],
         )?;
         Ok(sha.to_vec())
     }
@@ -836,6 +826,49 @@ impl Catalog {
         )?;
         Ok(n as u32)
     }
+}
+
+/// The columns [`asset_from_row`] reads; callers append the `WHERE` clause.
+const SELECT_ASSETS: &str = "SELECT a.id, a.library_id, l.root_path, a.rel_path, a.format,
+        a.size_bytes, a.mtime_ns, a.content_sha256, a.triangle_count,
+        a.bbox_min_x, a.bbox_min_y, a.bbox_min_z,
+        a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
+        a.thumb_state, a.error
+ FROM assets a
+ JOIN libraries l ON l.id = a.library_id";
+
+/// An [`Asset`] from a [`SELECT_ASSETS`] row, without its tags.
+fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
+    let bbox = match (
+        r.get::<_, Option<f32>>(9)?,
+        r.get::<_, Option<f32>>(10)?,
+        r.get::<_, Option<f32>>(11)?,
+        r.get::<_, Option<f32>>(12)?,
+        r.get::<_, Option<f32>>(13)?,
+        r.get::<_, Option<f32>>(14)?,
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some(BBox {
+            min: [a, b, c],
+            max: [d, e, f],
+        }),
+        _ => None,
+    };
+    let format = AssetFormat::parse(&r.get::<_, String>(4)?).unwrap_or(AssetFormat::Stl);
+    Ok(Asset {
+        id: r.get(0)?,
+        library_id: r.get(1)?,
+        root_path: PathBuf::from(r.get::<_, String>(2)?),
+        rel_path: r.get(3)?,
+        format,
+        size_bytes: r.get::<_, i64>(5)? as u64,
+        mtime_ns: r.get(6)?,
+        content_sha256: r.get(7)?,
+        triangle_count: r.get(8)?,
+        bbox,
+        thumb_state: ThumbState::parse(&r.get::<_, String>(15)?),
+        error: r.get(16)?,
+        tags: Vec::new(),
+    })
 }
 
 /// Attach one tag (created if new) to an asset. Blank names are ignored.
@@ -1769,6 +1802,58 @@ mod tests {
         assert_eq!(hashes[0], hashes[1]);
         assert_eq!(hashes[2], hashes[3]);
         assert_ne!(hashes[1], hashes[2]);
+    }
+
+    #[test]
+    fn unhashed_assets_pages_through_online_files_without_a_hash() {
+        let online = tempfile::tempdir().unwrap();
+        let offline = tempfile::tempdir().unwrap();
+        let (cat, _, _) = catalog_with(online.path(), &["a.stl", "b.stl", "c.stl"]);
+        write_mesh(&offline.path().join("d.stl"));
+        let gone = cat.add_library(offline.path()).unwrap();
+        cat.scan_library(&gone).unwrap();
+        offline.close().unwrap();
+        let b = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|a| a.rel_path == "b.stl")
+            .unwrap();
+        cat.hash_asset(&b).unwrap();
+
+        let mut seen = Vec::new();
+        let mut after = 0;
+        while let Some(asset) = cat.unhashed_assets(after, 1).unwrap().pop() {
+            assert!(asset.id > after);
+            after = asset.id;
+            seen.push(asset.rel_path);
+        }
+        seen.sort();
+        assert_eq!(seen, ["a.stl", "c.stl"]);
+    }
+
+    #[test]
+    fn hash_asset_skips_storing_once_a_scan_saw_the_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, _) = catalog_with(dir.path(), &["a.stl"]);
+        let first = |cat: &Catalog| cat.assets(&AssetQuery::default()).unwrap().remove(0);
+        let before = first(&cat);
+        assert!(before.unchanged_on_disk());
+
+        fs::write(
+            dir.path().join("a.stl"),
+            b"solid changed\nendsolid changed\n",
+        )
+        .unwrap();
+        assert!(!before.unchanged_on_disk());
+        cat.scan_library(&lib).unwrap();
+        // `before` describes the old file, so its hash can't go on the new row.
+        cat.hash_asset(&before).unwrap();
+        let after = first(&cat);
+        assert_eq!(after.content_sha256, None);
+
+        cat.hash_asset(&after).unwrap();
+        assert!(first(&cat).content_sha256.is_some());
     }
 
     #[test]
