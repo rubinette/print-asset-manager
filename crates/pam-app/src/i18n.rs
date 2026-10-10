@@ -152,6 +152,7 @@ pub enum Key {
     DeleteEllipsis,
     Delete,
     RemoveSavedSearchDetail,
+    NearbyFiles,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -579,6 +580,8 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::Delete) => "Delete",
         (Language::Chinese, Key::RemoveSavedSearchDetail) => "只會刪除這個已存搜尋，不會動到任何檔案。",
         (Language::English, Key::RemoveSavedSearchDetail) => "Only the saved search is deleted; no files are touched.",
+        (Language::Chinese, Key::NearbyFiles) => "同資料夾的圖片與說明",
+        (Language::English, Key::NearbyFiles) => "Images and docs nearby",
     }
 }
 
@@ -780,6 +783,7 @@ mod tests {
             Key::DeleteEllipsis,
             Key::Delete,
             Key::RemoveSavedSearchDetail,
+            Key::NearbyFiles,
         ];
         for key in KEYS {
             assert!(

@@ -3,6 +3,7 @@ mod filters;
 mod format;
 mod inspector;
 mod library;
+mod nearby;
 mod preview;
 mod print_status;
 mod removal;
@@ -36,6 +37,7 @@ use asset_view::{
 };
 use filters::{filter_bar, parse_bed, Filters, PrintTimeBucket, SizeBucket, DEFAULT_BED};
 use inspector::inspector;
+use nearby::Nearby;
 use preview::PreviewMesh;
 use saved::{NameTarget, SavedEntry};
 use sidebar::{sidebar, FolderNode, Location};
@@ -120,6 +122,8 @@ pub struct Workspace {
     preview_busy: bool,
     preview_dirty: bool,
     last_preview_pos: Option<Point<Pixels>>,
+    /// Images and documents next to the selected asset.
+    nearby: Nearby,
     watch: Option<WatchHandle>,
     scan_done: u32,
     scan_total: u32,
@@ -269,6 +273,7 @@ impl Workspace {
             preview_busy: false,
             preview_dirty: false,
             last_preview_pos: None,
+            nearby: Nearby::default(),
             watch: WatchHandle::start().ok(),
             scan_done: 0,
             scan_total: 0,
@@ -445,6 +450,9 @@ impl Render for Workspace {
             cx.defer_in(window, |this, window, cx| {
                 this.sync_inspector_inputs(window, cx)
             });
+        }
+        if self.nearby.asset_id != self.selected {
+            cx.defer_in(window, |this, _, cx| this.load_nearby(cx));
         }
         v_flex()
             .size_full()

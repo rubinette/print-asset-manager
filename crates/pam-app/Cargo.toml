@@ -14,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 gpui-kit.workspace = true
-image.workspace = true
+# JPEG and WebP for the photos shown next to a model.
+image = { workspace = true, features = ["jpeg", "webp"] }
 pam-core.workspace = true
 pam-preview.workspace = true
 serde_json.workspace = true

@@ -16,6 +16,7 @@ use pam_preview::Camera;
 use crate::i18n::{self, Key};
 
 use super::format::{format_date, group_digits};
+use super::nearby::nearby_section;
 use super::print_status::{status_buttons, status_date};
 use super::Workspace;
 
@@ -287,6 +288,7 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                         }))
                 }),
         )
+        .children(nearby_section(this, cx))
 }
 
 /// Inspector body for a multi-selection: add tags to all, remove a tag from
