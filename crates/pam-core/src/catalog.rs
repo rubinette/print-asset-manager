@@ -82,6 +82,15 @@ CREATE TABLE IF NOT EXISTS print_info (
   layer_height REAL
 );
 
+-- Searches saved to the sidebar. `query` is the app's own encoding of the
+-- folder, search text and filters; the catalog only stores it.
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  query TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 -- User data (tags, ...) of files that left the index, keyed by content hash,
 -- as JSON. A file moved to another library gets it back once it is hashed
 -- there. Moves inside one library keep their row instead (`relink_moved`).
@@ -380,6 +389,14 @@ pub struct AssetQuery {
     pub sort: AssetSort,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedSearch {
+    pub id: i64,
+    pub name: String,
+    /// Opaque to the catalog; see the `saved_searches` table.
+    pub query: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScanStats {
     pub added: u32,
@@ -592,133 +609,7 @@ impl Catalog {
         let conn = self.conn.lock().unwrap();
         let mut sql = format!("{SELECT_ASSETS} WHERE 1=1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
-        if let Some(id) = query.library_id {
-            sql.push_str(" AND a.library_id = ?");
-            args.push(id.into());
-        }
-        if let Some(dir) = query.dir.as_deref().map(|d| d.trim_matches('/')) {
-            if !dir.is_empty() {
-                sql.push_str(" AND a.rel_path LIKE ? ESCAPE '\\'");
-                args.push(format!("{}/%", escape_like(dir)).into());
-            }
-        }
-        if !query.tags.is_empty() {
-            sql.push_str(&format!(
-                " AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
-                   WHERE t.name IN ({}) GROUP BY at.asset_id",
-                placeholders(query.tags.len())
-            ));
-            args.extend(query.tags.iter().map(|t| t.clone().into()));
-            if query.tag_mode == TagMode::All {
-                sql.push_str(" HAVING COUNT(DISTINCT t.id) = ?");
-                let distinct: HashSet<&String> = query.tags.iter().collect();
-                args.push((distinct.len() as i64).into());
-            }
-            sql.push(')');
-        }
-        if query.untagged {
-            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
-        }
-        match query.print_status {
-            Some(StatusFilter::Is(status)) => {
-                sql.push_str(" AND a.id IN (SELECT asset_id FROM asset_notes WHERE status = ?)");
-                args.push(status.as_str().to_string().into());
-            }
-            Some(StatusFilter::Unmarked) => sql.push_str(
-                " AND a.id NOT IN (SELECT asset_id FROM asset_notes WHERE status IS NOT NULL)",
-            ),
-            None => {}
-        }
-        if !query.formats.is_empty() {
-            sql.push_str(&format!(
-                " AND a.format IN ({})",
-                placeholders(query.formats.len())
-            ));
-            args.extend(query.formats.iter().map(|f| f.as_str().to_string().into()));
-        }
-        if let Some([x, y, z]) = query.fits_bed {
-            sql.push_str(
-                " AND a.bbox_min_x IS NOT NULL
-                  AND (a.bbox_max_z - a.bbox_min_z) <= ?
-                  AND (((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?)
-                    OR ((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?))",
-            );
-            for v in [z, x, y, y, x] {
-                args.push(f64::from(v).into());
-            }
-        }
-        if let Some((min, max)) = query.file_size {
-            sql.push_str(" AND a.size_bytes >= ?");
-            args.push((min as i64).into());
-            if let Some(max) = max {
-                sql.push_str(" AND a.size_bytes < ?");
-                args.push((max as i64).into());
-            }
-        }
-        if let Some(since) = query.modified_since_ns {
-            sql.push_str(" AND a.mtime_ns >= ?");
-            args.push(since.into());
-        }
-        if query.duplicates_only {
-            sql.push_str(
-                " AND a.content_sha256 IN (
-                    SELECT content_sha256 FROM assets WHERE content_sha256 IS NOT NULL
-                    GROUP BY content_sha256 HAVING COUNT(*) > 1)",
-            );
-        }
-        if let Some(search) = query.search.as_ref().map(|s| s.trim().to_string()) {
-            if !search.is_empty() {
-                let like = format!("%{}%", escape_like(&search));
-                sql.push_str(
-                    " AND (a.rel_path LIKE ? ESCAPE '\\' OR a.id IN (
-                        SELECT at.asset_id FROM asset_tags at
-                        JOIN tags t ON t.id = at.tag_id
-                        WHERE t.name LIKE ? ESCAPE '\\'
-                      ) OR a.id IN (
-                        SELECT asset_id FROM asset_notes WHERE note LIKE ? ESCAPE '\\'
-                      ) OR a.id IN (
-                        SELECT asset_id FROM print_info
-                        WHERE COALESCE(title, '') || ' ' || COALESCE(designer, '') || ' '
-                              || COALESCE(printer, '') || ' ' || materials LIKE ? ESCAPE '\\'
-                      ) OR a.id IN (
-                        SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
-                      ))",
-                );
-                args.push(like.clone().into());
-                args.push(like.clone().into());
-                args.push(like.clone().into());
-                args.push(like.into());
-                args.push(fts_query(&search).into());
-            }
-        }
-        if !query.materials.is_empty() {
-            sql.push_str(&format!(
-                " AND a.id IN (SELECT p.asset_id FROM print_info p, json_each(p.materials) m
-                   WHERE m.value IN ({}))",
-                placeholders(query.materials.len())
-            ));
-            args.extend(query.materials.iter().map(|m| m.clone().into()));
-        }
-        if let Some((min, max)) = query.print_time {
-            sql.push_str(" AND a.id IN (SELECT asset_id FROM print_info WHERE print_time_s >= ?");
-            args.push((min as i64).into());
-            if let Some(max) = max {
-                sql.push_str(" AND print_time_s < ?");
-                args.push((max as i64).into());
-            }
-            sql.push(')');
-        }
-        if let Some(state) = query.thumb_state {
-            sql.push_str(" AND a.thumb_state = ?");
-            args.push(state.as_str().to_string().into());
-        }
-        if let Some(ids) = online {
-            sql.push_str(&format!(
-                " AND a.library_id IN ({})",
-                placeholders(ids.len())
-            ));
-            args.extend(ids.into_iter().map(Into::into));
-        }
+        push_query_filters(query, online, &mut sql, &mut args);
         query.sort.push_order_by(&mut sql, query.duplicates_only);
         if let Some(limit) = query.limit {
             sql.push_str(" LIMIT ?");
@@ -762,6 +653,21 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    /// How many assets [`Self::assets`] would return, ignoring `limit`.
+    pub fn count(&self, query: &AssetQuery) -> Result<u32> {
+        let online = if query.online_only {
+            Some(self.online_library_ids()?)
+        } else {
+            None
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from("SELECT COUNT(*) FROM assets a WHERE 1=1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        push_query_filters(query, online, &mut sql, &mut args);
+        let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |r| r.get(0))?;
+        Ok(n as u32)
     }
 
     /// Libraries whose root is currently reachable.
@@ -1067,6 +973,55 @@ impl Catalog {
         Ok(())
     }
 
+    /// Saved searches by name.
+    pub fn saved_searches(&self) -> Result<Vec<SavedSearch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, query FROM saved_searches ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SavedSearch {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                query: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn add_saved_search(&self, name: &str, query: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO saved_searches (name, query, created_at) VALUES (?1, ?2, ?3)",
+            params![name.trim(), query, now_secs()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn rename_saved_search(&self, id: i64, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE saved_searches SET name = ?2 WHERE id = ?1",
+            params![id, name.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_saved_search_query(&self, id: i64, query: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE saved_searches SET query = ?2 WHERE id = ?1",
+            params![id, query],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_saved_search(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM saved_searches WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Relative paths of every asset in a library, for building its folder tree.
     pub fn rel_paths(&self, library_id: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
@@ -1097,6 +1052,144 @@ impl Catalog {
             |r| r.get(0),
         )?;
         Ok(n as u32)
+    }
+}
+
+/// Append `query`'s conditions (all on `assets a`) to `sql`, a statement
+/// ending in a `WHERE` clause, and their values to `args`. `online` lists
+/// the reachable libraries when the query asks for online ones only.
+fn push_query_filters(
+    query: &AssetQuery,
+    online: Option<Vec<i64>>,
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+) {
+    if let Some(id) = query.library_id {
+        sql.push_str(" AND a.library_id = ?");
+        args.push(id.into());
+    }
+    if let Some(dir) = query.dir.as_deref().map(|d| d.trim_matches('/')) {
+        if !dir.is_empty() {
+            sql.push_str(" AND a.rel_path LIKE ? ESCAPE '\\'");
+            args.push(format!("{}/%", escape_like(dir)).into());
+        }
+    }
+    if !query.tags.is_empty() {
+        sql.push_str(&format!(
+            " AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+               WHERE t.name IN ({}) GROUP BY at.asset_id",
+            placeholders(query.tags.len())
+        ));
+        args.extend(query.tags.iter().map(|t| t.clone().into()));
+        if query.tag_mode == TagMode::All {
+            sql.push_str(" HAVING COUNT(DISTINCT t.id) = ?");
+            let distinct: HashSet<&String> = query.tags.iter().collect();
+            args.push((distinct.len() as i64).into());
+        }
+        sql.push(')');
+    }
+    if query.untagged {
+        sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
+    }
+    match query.print_status {
+        Some(StatusFilter::Is(status)) => {
+            sql.push_str(" AND a.id IN (SELECT asset_id FROM asset_notes WHERE status = ?)");
+            args.push(status.as_str().to_string().into());
+        }
+        Some(StatusFilter::Unmarked) => sql.push_str(
+            " AND a.id NOT IN (SELECT asset_id FROM asset_notes WHERE status IS NOT NULL)",
+        ),
+        None => {}
+    }
+    if !query.formats.is_empty() {
+        sql.push_str(&format!(
+            " AND a.format IN ({})",
+            placeholders(query.formats.len())
+        ));
+        args.extend(query.formats.iter().map(|f| f.as_str().to_string().into()));
+    }
+    if let Some([x, y, z]) = query.fits_bed {
+        sql.push_str(
+            " AND a.bbox_min_x IS NOT NULL
+              AND (a.bbox_max_z - a.bbox_min_z) <= ?
+              AND (((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?)
+                OR ((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?))",
+        );
+        for v in [z, x, y, y, x] {
+            args.push(f64::from(v).into());
+        }
+    }
+    if let Some((min, max)) = query.file_size {
+        sql.push_str(" AND a.size_bytes >= ?");
+        args.push((min as i64).into());
+        if let Some(max) = max {
+            sql.push_str(" AND a.size_bytes < ?");
+            args.push((max as i64).into());
+        }
+    }
+    if let Some(since) = query.modified_since_ns {
+        sql.push_str(" AND a.mtime_ns >= ?");
+        args.push(since.into());
+    }
+    if query.duplicates_only {
+        sql.push_str(
+            " AND a.content_sha256 IN (
+                SELECT content_sha256 FROM assets WHERE content_sha256 IS NOT NULL
+                GROUP BY content_sha256 HAVING COUNT(*) > 1)",
+        );
+    }
+    if let Some(search) = query.search.as_ref().map(|s| s.trim().to_string()) {
+        if !search.is_empty() {
+            let like = format!("%{}%", escape_like(&search));
+            sql.push_str(
+                " AND (a.rel_path LIKE ? ESCAPE '\\' OR a.id IN (
+                    SELECT at.asset_id FROM asset_tags at
+                    JOIN tags t ON t.id = at.tag_id
+                    WHERE t.name LIKE ? ESCAPE '\\'
+                  ) OR a.id IN (
+                    SELECT asset_id FROM asset_notes WHERE note LIKE ? ESCAPE '\\'
+                  ) OR a.id IN (
+                    SELECT asset_id FROM print_info
+                    WHERE COALESCE(title, '') || ' ' || COALESCE(designer, '') || ' '
+                          || COALESCE(printer, '') || ' ' || materials LIKE ? ESCAPE '\\'
+                  ) OR a.id IN (
+                    SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
+                  ))",
+            );
+            args.push(like.clone().into());
+            args.push(like.clone().into());
+            args.push(like.clone().into());
+            args.push(like.into());
+            args.push(fts_query(&search).into());
+        }
+    }
+    if !query.materials.is_empty() {
+        sql.push_str(&format!(
+            " AND a.id IN (SELECT p.asset_id FROM print_info p, json_each(p.materials) m
+               WHERE m.value IN ({}))",
+            placeholders(query.materials.len())
+        ));
+        args.extend(query.materials.iter().map(|m| m.clone().into()));
+    }
+    if let Some((min, max)) = query.print_time {
+        sql.push_str(" AND a.id IN (SELECT asset_id FROM print_info WHERE print_time_s >= ?");
+        args.push((min as i64).into());
+        if let Some(max) = max {
+            sql.push_str(" AND print_time_s < ?");
+            args.push((max as i64).into());
+        }
+        sql.push(')');
+    }
+    if let Some(state) = query.thumb_state {
+        sql.push_str(" AND a.thumb_state = ?");
+        args.push(state.as_str().to_string().into());
+    }
+    if let Some(ids) = online {
+        sql.push_str(&format!(
+            " AND a.library_id IN ({})",
+            placeholders(ids.len())
+        ));
+        args.extend(ids.into_iter().map(Into::into));
     }
 }
 
@@ -2816,6 +2909,63 @@ mod tests {
             cat.all_materials().unwrap(),
             [("PLA".to_string(), 2), ("PETG".to_string(), 1)]
         );
+    }
+
+    #[test]
+    fn saved_searches_roundtrip_sorted_by_name() {
+        let cat = Catalog::open_memory().unwrap();
+        let b = cat.add_saved_search(" b ", "{}").unwrap();
+        let a = cat.add_saved_search("A", r#"{"search":"x"}"#).unwrap();
+        let names = |cat: &Catalog| -> Vec<String> {
+            cat.saved_searches()
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        assert_eq!(names(&cat), ["A", "b"]);
+        cat.rename_saved_search(b, "0 first").unwrap();
+        cat.set_saved_search_query(a, "{}").unwrap();
+        assert_eq!(names(&cat), ["0 first", "A"]);
+        assert_eq!(cat.saved_searches().unwrap()[1].query, "{}");
+        cat.remove_saved_search(b).unwrap();
+        assert_eq!(names(&cat), ["A"]);
+    }
+
+    #[test]
+    fn count_matches_assets_without_loading_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "sub/c.obj"]);
+        cat.set_status(&[ids["a.stl"]], Some(PrintStatus::Todo))
+            .unwrap();
+        for query in [
+            AssetQuery::default(),
+            AssetQuery {
+                formats: vec![AssetFormat::Stl],
+                ..Default::default()
+            },
+            AssetQuery {
+                print_status: Some(StatusFilter::Unmarked),
+                search: Some("c".into()),
+                ..Default::default()
+            },
+            AssetQuery {
+                dir: Some("sub".into()),
+                online_only: true,
+                limit: Some(1),
+                ..Default::default()
+            },
+        ] {
+            let unlimited = AssetQuery {
+                limit: None,
+                ..query.clone()
+            };
+            assert_eq!(
+                cat.count(&query).unwrap() as usize,
+                cat.assets(&unlimited).unwrap().len(),
+                "{query:?}"
+            );
+        }
     }
 
     #[test]

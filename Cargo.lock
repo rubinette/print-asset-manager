@@ -4867,6 +4867,7 @@ dependencies = [
  "image",
  "pam-core",
  "pam-preview",
+ "serde_json",
  "sys-locale",
  "tempfile",
 ]

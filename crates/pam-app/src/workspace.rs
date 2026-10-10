@@ -6,6 +6,7 @@ mod library;
 mod preview;
 mod print_status;
 mod removal;
+mod saved;
 mod selection;
 mod sidebar;
 mod toolbar;
@@ -36,6 +37,7 @@ use asset_view::{
 use filters::{filter_bar, parse_bed, Filters, PrintTimeBucket, SizeBucket, DEFAULT_BED};
 use inspector::inspector;
 use preview::PreviewMesh;
+use saved::{NameTarget, SavedEntry};
 use sidebar::{sidebar, FolderNode, Location};
 use toolbar::toolbar;
 
@@ -93,6 +95,10 @@ pub struct Workspace {
     /// Expanded tree nodes as (library id, folder path); "" is the library itself.
     expanded: HashSet<(i64, String)>,
     duplicate_count: u32,
+    saved: Vec<SavedEntry>,
+    /// Name input of the save/rename dialog, and what it is naming.
+    saved_name_input: Entity<InputState>,
+    naming: Option<NameTarget>,
     /// Assets sharing the primary selection's content hash, itself included.
     selected_copies: u32,
     search: Entity<InputState>,
@@ -150,6 +156,7 @@ impl Workspace {
         let batch_tag_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::AddTagsHint)));
         let note_input = cx.new(|cx| print_status::new_note_input(window, cx));
+        let saved_name_input = cx.new(|cx| InputState::new(window, cx));
 
         let card_size = read_pref("card_size")
             .and_then(|raw| raw.trim().parse::<f32>().ok())
@@ -206,6 +213,13 @@ impl Workspace {
                 _ => {}
             },
         ));
+        subs.push(
+            cx.subscribe_in(&saved_name_input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_name(window, cx);
+                }
+            }),
+        );
         subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             apply_system_theme(Some(window), cx);
             if this.selected.is_some() {
@@ -232,6 +246,9 @@ impl Workspace {
             folder_trees: HashMap::new(),
             expanded: HashSet::new(),
             duplicate_count: 0,
+            saved: Vec::new(),
+            saved_name_input,
+            naming: None,
             selected_copies: 0,
             search,
             tag_input,
@@ -334,15 +351,20 @@ impl Workspace {
         if !cache_fresh {
             self.preview_mesh = None;
         }
+        self.reload_saved();
         cx.notify();
     }
 
     fn query(&self) -> AssetQuery {
-        let (library_id, dir) = match &self.location {
+        self.query_for(&self.location, &self.filters, &self.search_text)
+    }
+
+    /// The catalog query for a sidebar location, filters and search text.
+    fn query_for(&self, location: &Location, f: &Filters, search: &str) -> AssetQuery {
+        let (library_id, dir) = match location {
             Location::Library { id, dir } => (Some(*id), dir.clone()),
             Location::All | Location::Duplicates => (None, None),
         };
-        let f = &self.filters;
         AssetQuery {
             library_id,
             dir,
@@ -359,11 +381,11 @@ impl Workspace {
             materials: f.materials.clone(),
             print_time: f.print_time.map(PrintTimeBucket::range),
             thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
-            duplicates_only: self.location == Location::Duplicates,
-            search: if self.search_text.trim().is_empty() {
+            duplicates_only: *location == Location::Duplicates,
+            search: if search.trim().is_empty() {
                 None
             } else {
-                Some(self.search_text.clone())
+                Some(search.to_string())
             },
             sort: self.sort,
             ..Default::default()

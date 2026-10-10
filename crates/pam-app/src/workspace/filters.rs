@@ -39,6 +39,15 @@ impl SizeBucket {
         }
     }
 
+    fn name(self) -> &'static str {
+        match self {
+            Self::Under1 => "under1mb",
+            Self::From1To10 => "1to10mb",
+            Self::From10To100 => "10to100mb",
+            Self::Over100 => "over100mb",
+        }
+    }
+
     fn key(self) -> Key {
         match self {
             Self::Under1 => Key::FileSizeUnder1Mb,
@@ -77,6 +86,15 @@ impl PrintTimeBucket {
         }
     }
 
+    fn name(self) -> &'static str {
+        match self {
+            Self::Under1h => "under1h",
+            Self::From1To4h => "1to4h",
+            Self::From4To12h => "4to12h",
+            Self::Over12h => "over12h",
+        }
+    }
+
     fn key(self) -> Key {
         match self {
             Self::Under1h => Key::PrintTimeUnder1h,
@@ -102,6 +120,14 @@ impl ModifiedWithin {
             Self::Week => 7,
             Self::Month => 30,
             Self::Year => 365,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
         }
     }
 
@@ -132,6 +158,132 @@ pub(super) struct Filters {
 }
 
 impl Filters {
+    /// As stored in a saved search. Unset filters are left out.
+    pub(super) fn to_json(&self) -> serde_json::Value {
+        use serde_json::{json, Map, Value};
+        let mut out = Map::new();
+        let mut put = |key: &str, value: Value| {
+            out.insert(key.into(), value);
+        };
+        if !self.formats.is_empty() {
+            put(
+                "formats",
+                json!(self.formats.iter().map(|f| f.as_str()).collect::<Vec<_>>()),
+            );
+        }
+        if self.fits_bed {
+            put("fits_bed", json!(true));
+        }
+        if let Some(bucket) = self.file_size {
+            put("file_size", json!(bucket.name()));
+        }
+        if let Some(within) = self.modified {
+            put("modified", json!(within.name()));
+        }
+        if !self.tags.is_empty() {
+            put("tags", json!(self.tags));
+            put(
+                "tag_mode",
+                json!(if self.tag_mode == TagMode::Any {
+                    "any"
+                } else {
+                    "all"
+                }),
+            );
+        }
+        if self.untagged {
+            put("untagged", json!(true));
+        }
+        if self.thumb_failed {
+            put("thumb_failed", json!(true));
+        }
+        if let Some(status) = self.status {
+            put(
+                "status",
+                json!(match status {
+                    StatusFilter::Is(status) => status.as_str(),
+                    StatusFilter::Unmarked => "unmarked",
+                }),
+            );
+        }
+        if !self.materials.is_empty() {
+            put("materials", json!(self.materials));
+        }
+        if let Some(bucket) = self.print_time {
+            put("print_time", json!(bucket.name()));
+        }
+        Value::Object(out)
+    }
+
+    /// Inverse of [`Self::to_json`]; anything missing or unknown is unset.
+    pub(super) fn from_json(value: &serde_json::Value) -> Self {
+        let text = |key: &str| value.get(key).and_then(|v| v.as_str());
+        let flag = |key: &str| value.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+        let list = |key: &str| -> Vec<String> {
+            value
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            formats: list("formats")
+                .iter()
+                .filter_map(|f| AssetFormat::parse(f))
+                .collect(),
+            fits_bed: flag("fits_bed"),
+            file_size: text("file_size")
+                .and_then(|n| SizeBucket::ALL.into_iter().find(|b| b.name() == n)),
+            modified: text("modified")
+                .and_then(|n| ModifiedWithin::ALL.into_iter().find(|m| m.name() == n)),
+            tags: list("tags"),
+            tag_mode: if text("tag_mode") == Some("any") {
+                TagMode::Any
+            } else {
+                TagMode::All
+            },
+            untagged: flag("untagged"),
+            thumb_failed: flag("thumb_failed"),
+            status: text("status").and_then(|s| match s {
+                "unmarked" => Some(StatusFilter::Unmarked),
+                other => PrintStatus::parse(other).map(StatusFilter::Is),
+            }),
+            materials: list("materials"),
+            print_time: text("print_time")
+                .and_then(|n| PrintTimeBucket::ALL.into_iter().find(|b| b.name() == n)),
+        }
+    }
+
+    /// Labels of the filters that are set, for naming a saved search.
+    pub(super) fn labels(&self, bed: [f32; 3]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        out.extend(self.formats.iter().map(|f| f.label().to_string()));
+        if self.fits_bed {
+            out.push(i18n::fits_bed(&bed_label(bed)));
+        }
+        out.extend(self.file_size.map(|b| i18n::t(b.key()).to_string()));
+        out.extend(self.modified.map(|m| i18n::t(m.key()).to_string()));
+        out.extend(self.tags.iter().cloned());
+        if self.untagged {
+            out.push(i18n::t(Key::Untagged).to_string());
+        }
+        if self.thumb_failed {
+            out.push(i18n::t(Key::ThumbFailed).to_string());
+        }
+        out.extend(self.status.map(|s| match s {
+            StatusFilter::Is(status) => i18n::t(status_key(status)).to_string(),
+            StatusFilter::Unmarked => i18n::t(Key::Unmarked).to_string(),
+        }));
+        out.extend(self.materials.iter().cloned());
+        out.extend(self.print_time.map(|b| i18n::t(b.key()).to_string()));
+        out
+    }
+
     /// How many filter groups are narrowing the view (for the toolbar badge).
     pub(super) fn active_count(&self) -> usize {
         [
@@ -594,6 +746,49 @@ mod tests {
             assert_eq!(parse_bed(&bed_pref(bed)), Some(bed));
         }
         assert_eq!(bed_label([250.0, 210.0, 220.0]), "250×210×220");
+    }
+
+    #[::core::prelude::v1::test]
+    fn filters_roundtrip_through_json() {
+        use super::{Filters, ModifiedWithin, PrintTimeBucket, SizeBucket};
+        use pam_core::catalog::{PrintStatus, StatusFilter, TagMode};
+        use pam_core::mesh::AssetFormat;
+        assert_eq!(
+            Filters::from_json(&Filters::default().to_json()),
+            Filters::default()
+        );
+        assert_eq!(Filters::default().to_json().to_string(), "{}");
+        let all = Filters {
+            formats: vec![AssetFormat::ThreeMf, AssetFormat::Obj],
+            fits_bed: true,
+            file_size: Some(SizeBucket::From10To100),
+            modified: Some(ModifiedWithin::Month),
+            tags: vec!["船".into(), "calibration".into()],
+            tag_mode: TagMode::Any,
+            untagged: true,
+            thumb_failed: true,
+            status: Some(StatusFilter::Is(PrintStatus::Failed)),
+            materials: vec!["PETG".into()],
+            print_time: Some(PrintTimeBucket::From4To12h),
+        };
+        assert_eq!(Filters::from_json(&all.to_json()), all);
+        for (status, raw) in [
+            (StatusFilter::Unmarked, "unmarked"),
+            (StatusFilter::Is(PrintStatus::Todo), "todo"),
+        ] {
+            let f = Filters {
+                status: Some(status),
+                ..Default::default()
+            };
+            assert_eq!(f.to_json()["status"], raw);
+            assert_eq!(Filters::from_json(&f.to_json()), f);
+        }
+        // Unknown values (say, from a newer version) are dropped, not errors.
+        let odd =
+            serde_json::json!({"formats": ["step", "stl"], "file_size": "huge", "fits_bed": 1});
+        let parsed = Filters::from_json(&odd);
+        assert_eq!(parsed.formats, [AssetFormat::Stl]);
+        assert_eq!((parsed.file_size, parsed.fits_bed), (None, false));
     }
 
     #[::core::prelude::v1::test]

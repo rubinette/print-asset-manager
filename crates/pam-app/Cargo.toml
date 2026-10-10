@@ -17,6 +17,7 @@ gpui-kit.workspace = true
 image.workspace = true
 pam-core.workspace = true
 pam-preview.workspace = true
+serde_json.workspace = true
 sys-locale.workspace = true
 
 [dev-dependencies]

@@ -7,13 +7,16 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{h_flex, ActiveTheme, Icon, IconName, Selectable as _, Sizable as _};
+use gpui_kit::component::{
+    h_flex, ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+};
 use gpui_kit::{prelude::FluentBuilder as _, *};
 use pam_core::catalog::AssetSort;
 
 use crate::i18n::{self, Key};
 
 use super::asset_view::ViewMode;
+use super::saved::NameTarget;
 use super::{write_pref, Workspace};
 
 impl Workspace {
@@ -100,6 +103,16 @@ pub(super) fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     cx.notify();
                 }))
         })
+        .child(
+            Button::new("save-search")
+                .ghost()
+                .icon(Lucide::BookmarkPlus)
+                .tooltip(i18n::t(Key::SaveSearchEllipsis))
+                .disabled(!this.can_save_search())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_name_dialog(NameTarget::New, window, cx)
+                })),
+        )
         .child(div().flex_1())
         .child(activity(this, &theme))
         .child(

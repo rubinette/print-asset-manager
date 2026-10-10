@@ -142,6 +142,16 @@ pub enum Key {
     PrintTime1To4h,
     PrintTime4To12h,
     PrintTimeOver12h,
+    SavedSearches,
+    SaveSearch,
+    SaveSearchEllipsis,
+    RenameSavedSearch,
+    Save,
+    RenameEllipsis,
+    UpdateSavedSearch,
+    DeleteEllipsis,
+    Delete,
+    RemoveSavedSearchDetail,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -227,6 +237,13 @@ fn duration_for(language: Language, secs: u64) -> String {
         (Language::English, 0, m) => format!("{m} min"),
         (Language::English, h, 0) => format!("{h} h"),
         (Language::English, h, m) => format!("{h} h {m} min"),
+    }
+}
+
+pub fn remove_saved_search_confirm(name: &str) -> String {
+    match current() {
+        Language::Chinese => format!("要刪除已存搜尋「{name}」嗎？"),
+        Language::English => format!("Delete the saved search “{name}”?"),
     }
 }
 
@@ -542,6 +559,26 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::PrintTime4To12h) => "4–12 hours",
         (Language::Chinese, Key::PrintTimeOver12h) => "12 小時以上",
         (Language::English, Key::PrintTimeOver12h) => "Over 12 hours",
+        (Language::Chinese, Key::SavedSearches) => "已存搜尋",
+        (Language::English, Key::SavedSearches) => "Saved Searches",
+        (Language::Chinese, Key::SaveSearch) => "儲存搜尋",
+        (Language::English, Key::SaveSearch) => "Save Search",
+        (Language::Chinese, Key::SaveSearchEllipsis) => "儲存目前的搜尋…",
+        (Language::English, Key::SaveSearchEllipsis) => "Save Current Search…",
+        (Language::Chinese, Key::RenameSavedSearch) => "重新命名搜尋",
+        (Language::English, Key::RenameSavedSearch) => "Rename Search",
+        (Language::Chinese, Key::Save) => "儲存",
+        (Language::English, Key::Save) => "Save",
+        (Language::Chinese, Key::RenameEllipsis) => "重新命名…",
+        (Language::English, Key::RenameEllipsis) => "Rename…",
+        (Language::Chinese, Key::UpdateSavedSearch) => "改成目前的條件",
+        (Language::English, Key::UpdateSavedSearch) => "Update to Current Search",
+        (Language::Chinese, Key::DeleteEllipsis) => "刪除…",
+        (Language::English, Key::DeleteEllipsis) => "Delete…",
+        (Language::Chinese, Key::Delete) => "刪除",
+        (Language::English, Key::Delete) => "Delete",
+        (Language::Chinese, Key::RemoveSavedSearchDetail) => "只會刪除這個已存搜尋，不會動到任何檔案。",
+        (Language::English, Key::RemoveSavedSearchDetail) => "Only the saved search is deleted; no files are touched.",
     }
 }
 
@@ -733,6 +770,16 @@ mod tests {
             Key::PrintTime1To4h,
             Key::PrintTime4To12h,
             Key::PrintTimeOver12h,
+            Key::SavedSearches,
+            Key::SaveSearch,
+            Key::SaveSearchEllipsis,
+            Key::RenameSavedSearch,
+            Key::Save,
+            Key::RenameEllipsis,
+            Key::UpdateSavedSearch,
+            Key::DeleteEllipsis,
+            Key::Delete,
+            Key::RemoveSavedSearchDetail,
         ];
         for key in KEYS {
             assert!(
