@@ -67,7 +67,9 @@ fn parse_binary_stl(bytes: &[u8]) -> Option<Mesh> {
     }
     let f32_at = |b: &[u8], i: usize| f32::from_le_bytes(b[i..i + 4].try_into().unwrap());
     let tris: Vec<[[f32; 3]; 3]> = bytes[84..]
-        .chunks_exact(50)
+        .as_chunks::<50>()
+        .0
+        .iter()
         .map(|rec| {
             // Skip the 12-byte normal; vertices follow.
             std::array::from_fn(|v| std::array::from_fn(|c| f32_at(rec, 12 + v * 12 + c * 4)))
@@ -350,7 +352,7 @@ impl<R: Read + std::io::Seek> Package<R> {
             out.bbox.include(v);
             out.vertices.push(v);
         }
-        for tri in obj.indices.chunks_exact(3) {
+        for tri in obj.indices.as_chunks::<3>().0 {
             if tri.iter().all(|&i| i < n) {
                 out.indices.extend(tri.iter().map(|&i| base + i));
             }

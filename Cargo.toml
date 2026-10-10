@@ -7,7 +7,7 @@ default-members = ["crates/pam-app"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 pam-core = { path = "crates/pam-core" }

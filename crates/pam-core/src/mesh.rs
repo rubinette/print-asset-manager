@@ -27,7 +27,8 @@ impl AssetFormat {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Inverse of [`Self::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "stl" => Some(Self::Stl),
             "obj" => Some(Self::Obj),
@@ -60,9 +61,9 @@ impl BBox {
     }
 
     pub fn include(&mut self, p: [f32; 3]) {
-        for i in 0..3 {
-            self.min[i] = self.min[i].min(p[i]);
-            self.max[i] = self.max[i].max(p[i]);
+        for (i, v) in p.into_iter().enumerate() {
+            self.min[i] = self.min[i].min(v);
+            self.max[i] = self.max[i].max(v);
         }
     }
 
@@ -209,7 +210,7 @@ impl Mesh {
             })
             .collect();
         let mut indices = Vec::new();
-        for tri in self.indices.chunks_exact(3) {
+        for tri in self.indices.as_chunks::<3>().0 {
             let [a, b, c] = [0, 1, 2].map(|k| cluster_of[tri[k] as usize]);
             if a != b && b != c && a != c {
                 indices.extend_from_slice(&[a, b, c]);
@@ -265,8 +266,8 @@ mod tests {
             Some(AssetFormat::ThreeMf)
         );
         assert_eq!(AssetFormat::from_path(Path::new("a.txt")), None);
-        assert_eq!(AssetFormat::from_str("threemf"), Some(AssetFormat::ThreeMf));
-        assert_eq!(AssetFormat::from_str("nope"), None);
+        assert_eq!(AssetFormat::parse("threemf"), Some(AssetFormat::ThreeMf));
+        assert_eq!(AssetFormat::parse("nope"), None);
         assert_eq!(AssetFormat::Stl.as_str(), "stl");
         assert_eq!(AssetFormat::Obj.label(), "OBJ");
         assert_eq!(AssetFormat::ThreeMf.label(), "3MF");
@@ -344,7 +345,7 @@ mod tests {
         }
         // Closed surface in, closed surface out: every edge still has a twin.
         let mut edges = std::collections::HashMap::<(u32, u32), i32>::new();
-        for t in slim.indices.chunks_exact(3) {
+        for t in slim.indices.as_chunks::<3>().0 {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 *edges.entry((a.min(b), a.max(b))).or_default() += 1;
             }
