@@ -102,7 +102,19 @@ fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEleme
         .bg(theme.muted)
         .overflow_hidden()
         .when(has_selection, |el| el.cursor_grab())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event, _, _| this.on_preview_mouse_down(event)),
+        )
         .on_mouse_move(cx.listener(|this, event, _, cx| this.on_preview_drag(event, cx)))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.end_preview_drag(cx)),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.end_preview_drag(cx)),
+        )
         .on_scroll_wheel(cx.listener(|this, event, _, cx| this.on_preview_scroll(event, cx)))
         .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
             if event.click_count() > 1 {

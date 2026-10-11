@@ -167,6 +167,7 @@ impl Workspace {
         }
         self.camera = Camera::default();
         self.last_preview_pos = None;
+        self.preview_dragged = false;
         self.preview_busy = false;
         self.preview_dirty = false;
         if let Some(old) = self.preview_image.take() {
