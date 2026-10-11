@@ -390,7 +390,7 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
     let dropdown = |id: &'static str, label: String, active: bool| {
         Button::new(id)
             .small()
-            .when(active, |b| b.primary())
+            .when(active, |b| b.secondary())
             .when(!active, |b| b.outline())
             .label(label)
             .dropdown_caret(true)
@@ -434,6 +434,7 @@ pub(super) fn filter_bar(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
         .flex_wrap()
         .border_b_1()
         .border_color(theme.border)
+        .bg(theme.muted)
         .child(
             dropdown(
                 "filter-format",

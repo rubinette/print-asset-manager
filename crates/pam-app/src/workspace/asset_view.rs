@@ -16,6 +16,7 @@ use pam_core::open::open_path;
 use pam_core::paths::thumb_path;
 
 use crate::i18n::{self, Key};
+use crate::margin;
 use crate::{SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp};
 
 use super::format::{format_date, group_digits};
@@ -114,7 +115,7 @@ pub(super) fn asset_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .text_sm()
+                .text_size(margin::UI_SM)
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(Lucide::FolderSearch).large())
                 .child(i18n::t(if this.is_filtered() {
@@ -178,21 +179,20 @@ fn empty_state(cx: &mut Context<Workspace>) -> impl IntoElement {
         .child(
             div()
                 .p_4()
-                .rounded_full()
-                .bg(theme.muted)
+                .border_1()
+                .border_color(theme.border)
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(Lucide::Package).large()),
         )
         .child(
             div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(margin::TITLE)
                 .child(i18n::t(Key::EmptyTitle)),
         )
         .child(
             div()
                 .max_w(px(420.))
-                .text_sm()
+                .text_size(margin::UI_SM)
                 .text_center()
                 .text_color(theme.muted_foreground)
                 .child(i18n::t(Key::EmptyBody)),
@@ -353,22 +353,22 @@ fn card(
         .w(px(size))
         .p(px(CARD_PADDING))
         .gap_1p5()
-        .rounded_lg()
         .cursor_pointer()
         .border_1()
         .border_color(if selected {
-            theme.primary
+            theme.list_active_border
         } else {
             transparent_black()
         })
-        .when(selected, |el| el.bg(theme.secondary))
-        .hover(|el| el.bg(theme.secondary))
+        .when(selected, |el| el.bg(margin::selected_bg(&theme)))
+        .when(!selected, |el| {
+            el.hover(|el| el.bg(margin::hover_bg(&theme)))
+        })
         .child(
             div()
                 .relative()
                 .w_full()
                 .h(px(size - CARD_PADDING * 2.0))
-                .rounded_md()
                 .bg(theme.muted)
                 .overflow_hidden()
                 .child(thumb_content(asset, &theme))
@@ -378,9 +378,9 @@ fn card(
                         .top_1()
                         .left_1()
                         .px_1()
-                        .rounded_sm()
+                        .rounded(margin::RADIUS_SM)
                         .bg(theme.background.opacity(0.85))
-                        .text_xs()
+                        .text_size(margin::UI_XS)
                         .text_color(theme.muted_foreground)
                         .child(asset.format.label()),
                 )
@@ -402,14 +402,13 @@ fn card(
                 .min_w_0()
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(margin::UI_SM)
                         .truncate()
-                        .font_weight(FontWeight::MEDIUM)
                         .child(asset.name().to_string()),
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(margin::UI_XS)
                         .truncate()
                         .text_color(theme.muted_foreground)
                         .child(card_meta(asset)),
@@ -481,15 +480,15 @@ fn list(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .size_full()
         .child(
             h_flex()
-                .h(px(32.))
+                .h(margin::ROW)
                 .flex_shrink_0()
                 .px_3()
                 .gap_3()
                 .items_center()
                 .border_b_1()
                 .border_color(theme.border)
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
+                .bg(theme.list_head)
+                .text_size(margin::UI_XS)
                 .text_color(theme.muted_foreground)
                 .child(div().w(px(32.)))
                 .child(header_cell(
@@ -602,17 +601,18 @@ fn list_row(
         .px_3()
         .gap_3()
         .items_center()
-        .text_sm()
+        .text_size(margin::UI_SM)
         .cursor_pointer()
         .border_b_1()
-        .border_color(theme.border.opacity(0.5))
-        .when(selected, |el| el.bg(theme.secondary))
-        .hover(|el| el.bg(theme.secondary))
+        .border_color(theme.border)
+        .when(selected, |el| el.bg(margin::selected_bg(&theme)))
+        .when(!selected, |el| {
+            el.hover(|el| el.bg(margin::hover_bg(&theme)))
+        })
         .child(
             div()
                 .size(px(32.))
                 .flex_shrink_0()
-                .rounded_sm()
                 .bg(theme.muted)
                 .overflow_hidden()
                 .child(thumb_content(asset, &theme)),
@@ -627,17 +627,12 @@ fn list_row(
                         .items_center()
                         .min_w_0()
                         .children(status_badge(asset, &theme))
-                        .child(
-                            div()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(asset.name().to_string()),
-                        ),
+                        .child(div().truncate().child(asset.name().to_string())),
                 )
                 .when(!folder.is_empty(), |el| {
                     el.child(
                         div()
-                            .text_xs()
+                            .text_size(margin::UI_XS)
                             .truncate()
                             .text_color(theme.muted_foreground)
                             .child(folder),

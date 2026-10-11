@@ -14,6 +14,7 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 use pam_core::catalog::AssetSort;
 
 use crate::i18n::{self, Key};
+use crate::margin;
 
 use super::asset_view::ViewMode;
 use super::saved::NameTarget;
@@ -53,9 +54,11 @@ pub(super) fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .items_center()
         .border_b_1()
         .border_color(theme.border)
+        .bg(theme.muted)
         .child(
             div().w(px(320.)).child(
                 Input::new(&this.search)
+                    .small()
                     .cleanable(true)
                     .prefix(Icon::new(IconName::Search).small()),
             ),
@@ -63,6 +66,7 @@ pub(super) fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .child(
             Button::new("sort")
                 .ghost()
+                .small()
                 .icon(if sort_is_ascending(current_sort) {
                     IconName::SortAscending
                 } else {
@@ -90,6 +94,7 @@ pub(super) fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
             let active = this.filters.active_count();
             Button::new("filter")
                 .ghost()
+                .small()
                 .icon(Lucide::ListFilter)
                 .label(if active > 0 {
                     format!("{} · {active}", i18n::t(Key::Filter))
@@ -106,6 +111,7 @@ pub(super) fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .child(
             Button::new("save-search")
                 .ghost()
+                .small()
                 .icon(Lucide::BookmarkPlus)
                 .tooltip(i18n::t(Key::SaveSearchEllipsis))
                 .disabled(!this.can_save_search())
@@ -159,8 +165,10 @@ pub(super) fn toolbar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
             )
         })
         .child(
+            // Outlined: the inspector's Open is this screen's one primary action.
             Button::new("add-folder")
-                .primary()
+                .outline()
+                .small()
                 .label(i18n::t(Key::AddFolder))
                 .icon(IconName::Plus)
                 .on_click(cx.listener(|this, _, window, cx| this.add_folder(window, cx))),
@@ -190,7 +198,7 @@ fn activity(this: &Workspace, theme: &gpui_kit::component::Theme) -> impl IntoEl
     h_flex()
         .gap_2()
         .items_center()
-        .text_xs()
+        .text_size(margin::UI_XS)
         .text_color(theme.muted_foreground)
         .child(label)
         .when(busy, |el| {

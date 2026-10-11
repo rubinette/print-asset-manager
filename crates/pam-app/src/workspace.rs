@@ -27,6 +27,7 @@ use pam_preview::Camera;
 
 use crate::i18n::{self, Key, LanguagePref};
 use crate::jobs;
+use crate::margin;
 use crate::{
     apply_language, apply_system_theme, AddFolder, FocusSearch, OpenSelected, TrashSelected,
     UseChinese, UseEnglish, UseSystemLanguage,
@@ -514,11 +515,7 @@ fn title_bar(_cx: &mut Context<Workspace>) -> impl IntoElement {
             .items_center()
             .justify_between()
             .pr_2()
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(i18n::t(Key::AppTitle)),
-            ),
+            .child(div().text_size(margin::UI_SM).child(i18n::t(Key::AppTitle))),
     )
 }
 

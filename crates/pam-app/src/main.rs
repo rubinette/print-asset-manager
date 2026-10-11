@@ -1,5 +1,6 @@
 mod i18n;
 mod jobs;
+mod margin;
 mod workspace;
 
 use gpui_kit::component::{Root, TitleBar};
@@ -62,6 +63,7 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         i18n::init();
+        margin::init(cx);
         apply_system_theme(None, cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
