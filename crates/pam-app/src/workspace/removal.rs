@@ -174,7 +174,7 @@ impl Workspace {
 
 /// Confirm a destructive action. Cancel is the default: Enter and Escape
 /// both dismiss, and only clicking the danger button runs `on_confirm`.
-fn confirm_destructive(
+pub(super) fn confirm_destructive(
     window: &mut Window,
     cx: &mut App,
     title: String,

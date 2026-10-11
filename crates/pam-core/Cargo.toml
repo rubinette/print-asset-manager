@@ -12,6 +12,7 @@ image.workspace = true
 notify.workspace = true
 quick-xml = "0.37"
 rusqlite.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 stl_io.workspace = true
 thiserror.workspace = true

@@ -11,7 +11,7 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use pam_core::catalog::{Asset, AssetSort, ThumbState};
+use pam_core::catalog::{Asset, AssetSort, PrintStatus, ThumbState};
 use pam_core::open::open_path;
 use pam_core::paths::thumb_path;
 
@@ -20,6 +20,7 @@ use crate::{SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp};
 
 use super::format::{format_date, group_digits};
 use super::inspector::INSPECTOR_WIDTH;
+use super::print_status::{status_badge, status_icon, status_key};
 use super::selection::Step;
 use super::sidebar::SIDEBAR_WIDTH;
 use super::toolbar::sort_is_ascending;
@@ -241,12 +242,12 @@ fn asset_interactions(
             }
         });
     })
-    .context_menu(move |menu, _, cx| {
+    .context_menu(move |menu, window, cx| {
         let targets = workspace
             .upgrade()
             .map(|w| w.read(cx).targets_for(id))
             .unwrap_or_else(|| vec![id]);
-        asset_menu(menu, targets, path.clone(), workspace.clone())
+        asset_menu(menu, targets, path.clone(), workspace.clone(), window, cx)
     })
 }
 
@@ -257,6 +258,8 @@ fn asset_menu(
     targets: Vec<i64>,
     path: std::path::PathBuf,
     workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let (open, reveal, copy) = (path.clone(), path.clone(), path);
     let many = targets.len() > 1;
@@ -266,6 +269,8 @@ fn asset_menu(
         i18n::t(Key::MoveToTrashEllipsis).to_string()
     };
     let regenerate_targets = targets.clone();
+    let status_targets = targets.clone();
+    let status_workspace = workspace.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(Key::Open))
             .icon(IconName::ExternalLink)
@@ -286,6 +291,31 @@ fn asset_menu(
             }),
     )
     .separator()
+    .submenu_with_icon(
+        Some(Icon::new(Lucide::Printer)),
+        i18n::t(Key::PrintStatus),
+        window,
+        cx,
+        move |menu, _, _| {
+            let set = |status: Option<PrintStatus>| {
+                let (workspace, ids) = (status_workspace.clone(), status_targets.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = workspace.update(cx, |this, cx| this.set_status(&ids, status, cx));
+                }
+            };
+            PrintStatus::ALL
+                .into_iter()
+                .fold(menu, |menu, status| {
+                    menu.item(
+                        PopupMenuItem::new(i18n::t(status_key(status)))
+                            .icon(status_icon(status))
+                            .on_click(set(Some(status))),
+                    )
+                })
+                .separator()
+                .item(PopupMenuItem::new(i18n::t(Key::ClearStatus)).on_click(set(None)))
+        },
+    )
     .item({
         let workspace = workspace.clone();
         PopupMenuItem::new(i18n::t(if many {
@@ -353,7 +383,19 @@ fn card(
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(asset.format.label()),
-                ),
+                )
+                .when_some(status_badge(asset, &theme), |el, badge| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .p_0p5()
+                            .rounded_full()
+                            .bg(theme.background.opacity(0.85))
+                            .child(badge),
+                    )
+                }),
         )
         .child(
             v_flex()
@@ -580,10 +622,17 @@ fn list_row(
                 .flex_1()
                 .min_w_0()
                 .child(
-                    div()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(asset.name().to_string()),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .min_w_0()
+                        .children(status_badge(asset, &theme))
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(asset.name().to_string()),
+                        ),
                 )
                 .when(!folder.is_empty(), |el| {
                     el.child(

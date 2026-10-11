@@ -1,4 +1,5 @@
-//! Sidebar: all assets, duplicates, library folder trees, and tags.
+//! Sidebar: all assets, duplicates, library folder trees, saved searches,
+//! and tags.
 
 use std::collections::BTreeMap;
 
@@ -10,6 +11,7 @@ use pam_core::catalog::Library;
 
 use crate::i18n::{self, Key};
 
+use super::saved::saved_rows;
 use super::Workspace;
 
 pub(super) const SIDEBAR_WIDTH: f32 = 208.0;
@@ -218,6 +220,10 @@ pub(super) fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .flat_map(|lib| library_rows(this, lib, cx))
                 .collect::<Vec<_>>(),
         )
+        .when(!this.saved.is_empty(), |el| {
+            el.child(sidebar_section(i18n::t(Key::SavedSearches), &theme))
+        })
+        .children(saved_rows(this, cx))
         .when(!this.tags.is_empty(), |el| {
             el.child(sidebar_section(i18n::t(Key::Tags), &theme))
         })
@@ -396,7 +402,7 @@ fn sidebar_section(title: &'static str, theme: &gpui_kit::component::Theme) -> i
 }
 
 #[allow(clippy::too_many_arguments)]
-fn nav_item(
+pub(super) fn nav_item(
     id: impl Into<SharedString>,
     icon: Icon,
     label: String,

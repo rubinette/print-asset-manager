@@ -175,7 +175,7 @@ fn hsla_to_rgba(color: Hsla) -> [u8; 4] {
     ]
 }
 
-fn rgba_to_render_image(mut img: image::RgbaImage) -> Arc<RenderImage> {
+pub(super) fn rgba_to_render_image(mut img: image::RgbaImage) -> Arc<RenderImage> {
     for px in img.pixels_mut() {
         px.0.swap(0, 2);
     }

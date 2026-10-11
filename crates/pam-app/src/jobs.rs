@@ -6,12 +6,13 @@ use pam_core::catalog::{Asset, Catalog, ThumbState};
 use pam_core::load::{extract_3mf_thumbnail, load_mesh};
 use pam_core::mesh::AssetFormat;
 use pam_core::paths::thumb_path;
+use pam_core::print_info::read_3mf_print_info;
 use pam_preview::{encode_png, render_thumbnail};
 
 pub const THUMB_CONCURRENCY: usize = 2;
 const THUMB_BATCH: usize = THUMB_CONCURRENCY * 8;
 const THUMB_SIZE: u32 = 256;
-/// Assets fetched per query by the hashing pass.
+/// Assets fetched per query by the hashing and print info passes.
 const HASH_BATCH: usize = 64;
 /// Bump when rendered thumbnails would come out differently (renderer or
 /// loader changes); the app then redraws them once at startup.
@@ -157,12 +158,42 @@ fn hash_unhashed(catalog: &Catalog, fresh: &FreshHashes, hashed: &AtomicU32) {
     }
 }
 
-/// Hash files and generate thumbnails, side by side, until neither has work
-/// left. Bumps `hashed` per file hashed and `done` per thumbnail.
-pub fn drain(catalog: &Catalog, hashed: &AtomicU32, done: &AtomicU32) {
+/// Read the slicer metadata of every 3MF that doesn't have it yet, bumping
+/// `read` per file. Cheap next to hashing: only the zip directory and a few
+/// small entries are read.
+fn read_print_info(catalog: &Catalog, read: &AtomicU32) {
+    let mut after = 0;
+    loop {
+        let batch = catalog
+            .assets_without_print_info(after, HASH_BATCH)
+            .unwrap_or_default();
+        let Some(last) = batch.last() else {
+            break;
+        };
+        after = last.id;
+        for asset in &batch {
+            // Gone offline: try again when it is back.
+            if !asset.root_path.is_dir() {
+                continue;
+            }
+            // A file that isn't a readable 3MF has nothing to show; storing
+            // the empty result keeps it from being read on every pass.
+            let info = read_3mf_print_info(&asset.abs_path()).unwrap_or_default();
+            if catalog.set_print_info(asset, &info).is_ok() {
+                read.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Hash files, read 3MF slicer metadata and generate thumbnails, side by
+/// side, until none has work left. Bumps `indexed` per file hashed or read
+/// and `done` per thumbnail.
+pub fn drain(catalog: &Catalog, indexed: &AtomicU32, done: &AtomicU32) {
     let fresh = FreshHashes::default();
     std::thread::scope(|scope| {
-        scope.spawn(|| hash_unhashed(catalog, &fresh, hashed));
+        scope.spawn(|| hash_unhashed(catalog, &fresh, indexed));
+        scope.spawn(|| read_print_info(catalog, indexed));
         drain_pending(catalog, &fresh, done);
     });
 }
@@ -253,6 +284,23 @@ mod tests {
         let hex = done.sha256_hex().unwrap();
         assert!(thumb_path(&hex).exists());
         cleanup(&done);
+    }
+
+    #[test]
+    fn drain_reads_print_info_of_3mf_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_3mf_cube(&dir.path().join("cube.3mf"), false).unwrap();
+        fs::write(dir.path().join("broken.3mf"), b"not a zip").unwrap();
+        let catalog = Catalog::open_memory().unwrap();
+        let lib = catalog.add_library(dir.path()).unwrap();
+        catalog.scan_library(&lib).unwrap();
+        let read = AtomicU32::new(0);
+        read_print_info(&catalog, &read);
+        assert_eq!(read.load(Ordering::Relaxed), 2);
+        assert!(catalog.assets_without_print_info(0, 10).unwrap().is_empty());
+        for asset in catalog.assets(&AssetQuery::default()).unwrap() {
+            assert_eq!(asset.print, Some(Default::default()), "{}", asset.rel_path);
+        }
     }
 
     #[test]
