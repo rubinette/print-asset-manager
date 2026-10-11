@@ -80,7 +80,9 @@ pub(super) fn status_buttons(
             status.as_str()
         )))
         .small()
-        .when(on, |b| b.primary())
+        // On is a neutral fill, not the accent: the accent is reserved for
+        // the one primary action.
+        .when(on, |b| b.secondary())
         .when(!on, |b| b.outline())
         .icon(status_icon(status))
         .label(i18n::t(status_key(status)))

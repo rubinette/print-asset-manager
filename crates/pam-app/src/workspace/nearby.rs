@@ -12,6 +12,7 @@ use pam_core::open_path;
 use pam_core::sidecar::{find_sidecars, read_text_preview};
 
 use crate::i18n::{self, Key};
+use crate::margin;
 
 use super::preview::rgba_to_render_image;
 use super::Workspace;
@@ -181,7 +182,6 @@ pub(super) fn nearby_section(this: &Workspace, cx: &mut Context<Workspace>) -> O
             .id(("nearby-image", ix))
             .size(px(THUMB_SIZE))
             .flex_shrink_0()
-            .rounded_md()
             .overflow_hidden()
             .bg(theme.muted)
             .cursor_pointer()
@@ -208,10 +208,9 @@ pub(super) fn nearby_section(this: &Workspace, cx: &mut Context<Workspace>) -> O
             .gap_2()
             .px_1()
             .py_0p5()
-            .rounded_md()
-            .text_sm()
+            .text_size(margin::UI_SM)
             .cursor_pointer()
-            .hover(|el| el.bg(theme.secondary))
+            .hover(|el| el.bg(margin::hover_bg(&theme)))
             .on_click(open_on_click(path))
             .child(
                 div()
@@ -225,8 +224,7 @@ pub(super) fn nearby_section(this: &Workspace, cx: &mut Context<Workspace>) -> O
             .gap_1p5()
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(margin::UI_XS)
                     .text_color(theme.muted_foreground)
                     .child(i18n::t(Key::NearbyFiles)),
             )
@@ -241,9 +239,8 @@ pub(super) fn nearby_section(this: &Workspace, cx: &mut Context<Workspace>) -> O
                     div()
                         .px_2()
                         .py_1p5()
-                        .rounded_md()
-                        .bg(theme.secondary)
-                        .text_xs()
+                        .bg(theme.muted)
+                        .text_size(margin::UI_XS)
                         .text_color(theme.muted_foreground)
                         .line_clamp(README_PREVIEW_LINES)
                         .child(text),

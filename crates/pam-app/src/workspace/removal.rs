@@ -193,8 +193,10 @@ pub(super) fn confirm_destructive(
             .footer(
                 DialogFooter::new()
                     .child(
+                        // Outlined, not the accent: in the vermilion theme an
+                        // accent fill reads like the red destructive button.
                         Button::new("confirm-cancel")
-                            .primary()
+                            .outline()
                             .label(i18n::t(Key::Cancel))
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )

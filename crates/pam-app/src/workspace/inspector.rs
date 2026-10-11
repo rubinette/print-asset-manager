@@ -14,6 +14,7 @@ use pam_core::print_info::PrintInfo;
 use pam_preview::Camera;
 
 use crate::i18n::{self, Key};
+use crate::margin;
 
 use super::format::{format_date, group_digits};
 use super::nearby::nearby_section;
@@ -97,8 +98,9 @@ fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEleme
         .relative()
         .flex_1()
         .min_h(px(240.))
-        .m_3()
-        .rounded_lg()
+        .mb_3()
+        .border_b_1()
+        .border_color(theme.border)
         .bg(theme.muted)
         .overflow_hidden()
         .when(has_selection, |el| el.cursor_grab())
@@ -120,7 +122,7 @@ fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEleme
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_xs()
+                        .text_size(margin::UI_XS)
                         .child(i18n::t(Key::Failed))
                         .into_any_element()
                 })
@@ -130,7 +132,7 @@ fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEleme
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_xs()
+                .text_size(margin::UI_XS)
                 .text_color(theme.muted_foreground)
                 .child(this.status.text())
                 .into_any_element(),
@@ -139,7 +141,7 @@ fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEleme
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .text_sm()
+                .text_size(margin::UI_SM)
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(Lucide::Rotate3d).large())
                 .child(i18n::t(Key::NoSelection))
@@ -158,9 +160,9 @@ fn preview_pane(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEleme
                         div()
                             .px_2()
                             .py_0p5()
-                            .rounded_md()
+                            .rounded(margin::RADIUS_SM)
                             .bg(theme.background.opacity(0.8))
-                            .text_xs()
+                            .text_size(margin::UI_XS)
                             .text_color(theme.muted_foreground)
                             .child(i18n::t(Key::DragHint)),
                     ),
@@ -186,15 +188,14 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                 .min_w_0()
                 .child(
                     div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(margin::TITLE)
                         .truncate()
                         .child(asset.name().to_string()),
                 )
                 .child(
                     div()
                         .id("location")
-                        .text_xs()
+                        .text_size(margin::UI_XS)
                         .truncate()
                         .text_color(theme.muted_foreground)
                         .tooltip({
@@ -242,19 +243,21 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
             asset.print.as_ref().filter(|p| !p.is_empty()),
             |el, print| el.child(print_info_rows(print, &theme)),
         )
-        .child(Input::new(&this.tag_input).prefix(Icon::new(Lucide::Tag).small()))
+        .child(
+            Input::new(&this.tag_input)
+                .small()
+                .prefix(Icon::new(Lucide::Tag).small()),
+        )
         .child(
             v_flex()
                 .gap_1p5()
                 .child(
                     h_flex()
                         .justify_between()
-                        .text_sm()
+                        .text_size(margin::UI_XS)
                         .text_color(theme.muted_foreground)
                         .child(i18n::t(Key::PrintStatus))
-                        .when_some(status_date(asset), |el, date| {
-                            el.child(div().text_xs().child(date))
-                        }),
+                        .when_some(status_date(asset), |el, date| el.child(date)),
                 )
                 .child(status_buttons("status", asset.status, vec![asset.id], cx)),
         )
@@ -321,11 +324,14 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
         .gap_3()
         .child(
             div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(margin::TITLE)
                 .child(i18n::selected_count(total)),
         )
-        .child(Input::new(&this.batch_tag_input).prefix(Icon::new(Lucide::Tag).small()))
+        .child(
+            Input::new(&this.batch_tag_input)
+                .small()
+                .prefix(Icon::new(Lucide::Tag).small()),
+        )
         .when(!tag_counts.is_empty(), |el| {
             el.child(
                 h_flex()
@@ -337,9 +343,9 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
                             .pl_2()
                             .gap_0p5()
                             .items_center()
-                            .rounded_md()
+                            .rounded(margin::RADIUS_SM)
                             .bg(theme.secondary)
-                            .text_xs()
+                            .text_size(margin::UI_XS)
                             .child(if count == total {
                                 name.clone()
                             } else {
@@ -401,8 +407,7 @@ fn print_info_rows(print: &PrintInfo, theme: &gpui_kit::component::Theme) -> imp
         .gap_1p5()
         .child(
             div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(margin::UI_XS)
                 .text_color(theme.muted_foreground)
                 .child(i18n::t(Key::SlicerInfo)),
         )
@@ -420,7 +425,7 @@ fn meta_row(
     h_flex()
         .justify_between()
         .gap_3()
-        .text_sm()
+        .text_size(margin::UI_SM)
         .child(
             div()
                 .text_color(theme.muted_foreground)

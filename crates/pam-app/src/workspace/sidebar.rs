@@ -10,6 +10,7 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 use pam_core::catalog::Library;
 
 use crate::i18n::{self, Key};
+use crate::margin;
 
 use super::saved::saved_rows;
 use super::Workspace;
@@ -279,7 +280,7 @@ fn library_rows(this: &Workspace, lib: &Library, cx: &mut Context<Workspace>) ->
         }),
         &theme,
     )
-    .ml_0p5()
+    .pl(tree_indent(0))
     .context_menu(move |menu, _, _| {
         let workspace = workspace.clone();
         menu.item(
@@ -332,7 +333,7 @@ fn library_rows(this: &Workspace, lib: &Library, cx: &mut Context<Workspace>) ->
             }),
             &theme,
         )
-        .ml_0p5();
+        .pl(tree_indent(depth));
         let toggle_path = path.clone();
         rows.push(tree_row(
             format!("dir-{id}-{path}"),
@@ -346,8 +347,19 @@ fn library_rows(this: &Workspace, lib: &Library, cx: &mut Context<Workspace>) ->
     rows
 }
 
-/// Indents a sidebar item and puts a disclosure chevron in front of it.
-/// `expanded` is `None` for folders with nothing to expand.
+fn chevron_left(depth: usize) -> Pixels {
+    px(12.0 + depth as f32 * 12.0)
+}
+
+/// Left padding of a tree item at `depth`, leaving room for its chevron.
+fn tree_indent(depth: usize) -> Pixels {
+    chevron_left(depth) + px(20.)
+}
+
+/// Puts a disclosure chevron in front of a sidebar item indented with
+/// `tree_indent`. `expanded` is `None` for folders with nothing to expand.
+/// The item spans the full row, so its selected and hover grounds reach both
+/// edges like the other rows; the chevron sits on top of its left padding.
 fn tree_row(
     id: String,
     depth: usize,
@@ -356,14 +368,17 @@ fn tree_row(
     item: impl IntoElement,
     theme: &gpui_kit::component::Theme,
 ) -> AnyElement {
-    h_flex()
-        .pl(px(8.0 + depth as f32 * 12.0))
-        .items_center()
+    div()
+        .relative()
+        .child(item)
         .child(
             div()
                 .id(ElementId::Name(format!("toggle-{id}").into()))
-                .size(px(16.))
-                .flex_shrink_0()
+                .absolute()
+                .top_0()
+                .left(chevron_left(depth))
+                .w(px(16.))
+                .h(margin::ROW)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -379,7 +394,6 @@ fn tree_row(
                     )
                 }),
         )
-        .child(div().flex_1().min_w_0().child(item))
         .into_any_element()
 }
 
@@ -395,8 +409,7 @@ fn sidebar_section(title: &'static str, theme: &gpui_kit::component::Theme) -> i
         .px_4()
         .pt_4()
         .pb_1()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(margin::UI_XS)
         .text_color(theme.muted_foreground)
         .child(title)
 }
@@ -414,26 +427,24 @@ pub(super) fn nav_item(
 ) -> Stateful<Div> {
     h_flex()
         .id(ElementId::Name(id.into()))
-        .mx_2()
-        .px_2()
-        .py_1()
+        .h(margin::ROW)
+        .px_4()
         .gap_2()
         .items_center()
-        .rounded_md()
-        .text_sm()
+        .text_size(margin::UI_SM)
         .cursor_pointer()
         .when(dimmed, |el| el.text_color(theme.muted_foreground))
-        .when(selected, |el| {
-            el.bg(theme.accent).text_color(theme.accent_foreground)
+        .when(selected, |el| el.bg(margin::selected_bg(theme)))
+        .when(!selected, |el| {
+            el.hover(|el| el.bg(margin::hover_bg(theme)))
         })
-        .hover(|el| el.bg(theme.accent))
         .on_click(on_click)
         .child(icon.small())
         .child(div().flex_1().min_w_0().truncate().child(label))
         .when_some(trailing, |el, trailing| {
             el.child(
                 div()
-                    .text_xs()
+                    .text_size(margin::UI_XS)
                     .text_color(theme.muted_foreground)
                     .child(trailing),
             )
