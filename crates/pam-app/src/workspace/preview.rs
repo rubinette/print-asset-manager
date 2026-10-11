@@ -14,8 +14,11 @@ use super::{UiStatus, Workspace};
 
 const PREVIEW_SIZE: u32 = 640;
 
-/// Triangle budget while the user is dragging the preview.
-const DRAG_PREVIEW_TRIS: usize = 60_000;
+/// Triangle budget while the user is dragging the preview. Vertex clustering
+/// to this many leaves ~2 px cells in a 640 px frame (60k left ~4 px blocks
+/// that read as a coarse, faceted model), and the banded rasterizer draws it
+/// in about 20 ms on four cores.
+const DRAG_PREVIEW_TRIS: usize = 250_000;
 /// Triangle budget for the still preview. Past this a 640 px frame shows no
 /// more detail, while a 48M-triangle scan took 2 s per frame.
 const STILL_PREVIEW_TRIS: usize = 2_000_000;
@@ -73,7 +76,7 @@ impl Workspace {
         let camera = self.camera;
         let selected = asset.id;
         let background = hsla_to_rgba(cx.theme().muted);
-        let dragging = self.last_preview_pos.is_some();
+        let dragging = self.preview_dragged;
         let cached = self
             .preview_mesh
             .as_ref()
@@ -138,21 +141,36 @@ impl Workspace {
         .detach();
     }
 
+    pub(super) fn on_preview_mouse_down(&mut self, event: &MouseDownEvent) {
+        self.last_preview_pos = Some(event.position);
+    }
+
     pub(super) fn on_preview_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !event.dragging() {
-            // Drag just ended: replace the low-poly frame with a full-quality one.
-            if self.last_preview_pos.take().is_some() {
-                self.render_preview(cx);
-            }
+            self.end_preview_drag(cx);
             return;
         }
-        if let Some(prev) = self.last_preview_pos {
-            let dx = event.position.x.as_f32() - prev.x.as_f32();
-            let dy = event.position.y.as_f32() - prev.y.as_f32();
-            self.camera.orbit(dx, dy);
+        // Only drags that started on the preview orbit it.
+        let Some(prev) = self.last_preview_pos else {
+            return;
+        };
+        let dx = event.position.x.as_f32() - prev.x.as_f32();
+        let dy = event.position.y.as_f32() - prev.y.as_f32();
+        self.last_preview_pos = Some(event.position);
+        self.preview_dragged = true;
+        self.camera.orbit(dx, dy);
+        self.render_preview(cx);
+    }
+
+    /// Mouse released, wherever it is: replace the low-poly drag frame with a
+    /// full-quality one. Mouse moves only reach the preview while hovered, so
+    /// waiting for a button-up move left the coarse frame up after a release
+    /// outside the preview or without moving the mouse again.
+    pub(super) fn end_preview_drag(&mut self, cx: &mut Context<Self>) {
+        self.last_preview_pos = None;
+        if std::mem::take(&mut self.preview_dragged) {
             self.render_preview(cx);
         }
-        self.last_preview_pos = Some(event.position);
     }
 
     pub(super) fn on_preview_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {

@@ -37,7 +37,8 @@ impl Camera {
 }
 
 pub fn render_thumbnail(mesh: &Mesh, size: u32) -> RgbaImage {
-    render_mesh(mesh, &Camera::isometric(), size, size, BG)
+    // Thumbnails already render several at a time, one thread each.
+    render_mesh_bands(mesh, &Camera::isometric(), size, size, BG, 1)
 }
 
 pub fn render_mesh(
@@ -47,8 +48,31 @@ pub fn render_mesh(
     height: u32,
     background: [u8; 4],
 ) -> RgbaImage {
+    let bands = band_count(mesh, width, height);
+    render_mesh_bands(mesh, camera, width, height, background, bands)
+}
+
+/// One horizontal band of the frame per core, so a drag frame of a few
+/// hundred thousand triangles stays smooth; tiny renders aren't worth threads.
+fn band_count(mesh: &Mesh, width: u32, height: u32) -> usize {
+    if mesh.triangle_count() < 20_000 && width as u64 * height as u64 <= 128 * 128 {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(16))
+}
+
+/// `render_mesh` split into `bands` horizontal strips rasterized in parallel.
+/// Every band walks the triangles in order, so the image matches one band.
+fn render_mesh_bands(
+    mesh: &Mesh,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    background: [u8; 4],
+    bands: usize,
+) -> RgbaImage {
     // Renders every triangle; callers pass a `Mesh::simplified` LOD when they
-    // need speed (e.g. while dragging). ~100 ms for 3M triangles at 480 px.
+    // need speed (e.g. while dragging).
     let w = width.max(1) as i32;
     let h = height.max(1) as i32;
     let mut color = vec![background; (w * h) as usize];
@@ -68,19 +92,10 @@ pub fn render_mesh(
     // projecting geometry that is behind the camera.
     let near = radius * 1e-3;
 
-    // View space with depth positive in front of the camera.
-    let view_verts: Vec<[f32; 3]> = mesh
-        .vertices
-        .iter()
-        .map(|v| {
-            let p = mul(view, *v);
-            [p[0], p[1], -p[2]]
-        })
-        .collect();
     // Screen x/y plus 1/depth, which interpolates linearly in screen space
     // and keeps relative precision (NDC z crowds everything next to 1.0, so
     // thin walls z-fought and back faces bled through).
-    let to_screen = |p: [f32; 3]| {
+    let to_screen = move |p: [f32; 3]| {
         let inv = 1.0 / p[2];
         [
             (p[0] * focal / aspect * inv * 0.5 + 0.5) * (w as f32 - 1.0),
@@ -89,35 +104,194 @@ pub fn render_mesh(
         ]
     };
 
-    for tri in mesh.indices.as_chunks::<3>().0 {
-        let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+    // View space with depth positive in front of the camera, and the screen
+    // position of every vertex in front of the near plane.
+    let bands = bands.clamp(1, h as usize);
+    let mut view_verts = vec![[0.0f32; 3]; mesh.vertices.len()];
+    let mut screen = vec![[0.0f32; 3]; mesh.vertices.len()];
+    let chunk = mesh.vertices.len().div_ceil(bands).max(1);
+    let project = |src: &[[f32; 3]], vv: &mut [[f32; 3]], sv: &mut [[f32; 3]]| {
+        for ((v, out), s) in src.iter().zip(vv).zip(sv) {
+            let p = mul(view, *v);
+            *out = [p[0], p[1], -p[2]];
+            if out[2] >= near {
+                *s = to_screen(*out);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for ((src, vv), sv) in mesh
+            .vertices
+            .chunks(chunk)
+            .zip(view_verts.chunks_mut(chunk))
+            .zip(screen.chunks_mut(chunk))
+        {
+            if bands == 1 {
+                project(src, vv, sv);
+            } else {
+                scope.spawn(move || project(src, vv, sv));
+            }
+        }
+    });
+
+    let scene = Scene {
+        mesh,
+        view_verts: &view_verts,
+        screen: &screen,
+        near,
+        light,
+        to_screen: &to_screen,
+    };
+    let band_rows = (h as usize).div_ceil(bands);
+    let band_len = band_rows * w as usize;
+    std::thread::scope(|scope| {
+        for (i, (color, zbuf)) in color
+            .chunks_mut(band_len)
+            .zip(zbuf.chunks_mut(band_len))
+            .enumerate()
+        {
+            let y0 = (i * band_rows) as i32;
+            let band = Band {
+                color,
+                zbuf,
+                w,
+                y0,
+                y1: (y0 + band_rows as i32).min(h),
+            };
+            let scene = &scene;
+            if bands == 1 {
+                scene.draw(band);
+            } else {
+                scope.spawn(move || scene.draw(band));
+            }
+        }
+    });
+
+    to_image(width, height, &color)
+}
+
+/// What every band needs to rasterize the mesh.
+struct Scene<'a> {
+    mesh: &'a Mesh,
+    view_verts: &'a [[f32; 3]],
+    screen: &'a [[f32; 3]],
+    near: f32,
+    light: [f32; 3],
+    to_screen: &'a (dyn Fn([f32; 3]) -> [f32; 3] + Sync),
+}
+
+/// Rows `y0..y1` of the frame.
+struct Band<'a> {
+    color: &'a mut [[u8; 4]],
+    zbuf: &'a mut [f32],
+    w: i32,
+    y0: i32,
+    y1: i32,
+}
+
+impl Scene<'_> {
+    fn draw(&self, mut band: Band) {
+        let mesh = self.mesh;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            let (v0, v1, v2) = (
+                self.view_verts[i0],
+                self.view_verts[i1],
+                self.view_verts[i2],
+            );
+            let in_front = v0[2] >= self.near && v1[2] >= self.near && v2[2] >= self.near;
+            if in_front {
+                let (a, b, c) = (self.screen[i0], self.screen[i1], self.screen[i2]);
+                if !band.overlaps(a, b, c) {
+                    continue;
+                }
+                band.fill(a, b, c, self.shade(mesh, i0, i1, i2));
+                continue;
+            }
+            let (poly, count) = clip_near([v0, v1, v2], self.near);
+            if count < 3 {
+                continue;
+            }
+            let shade = self.shade(mesh, i0, i1, i2);
+            for k in 1..count - 1 {
+                let (a, b, c) = (
+                    (self.to_screen)(poly[0]),
+                    (self.to_screen)(poly[k]),
+                    (self.to_screen)(poly[k + 1]),
+                );
+                if band.overlaps(a, b, c) {
+                    band.fill(a, b, c, shade);
+                }
+            }
+        }
+    }
+
+    fn shade(&self, mesh: &Mesh, i0: usize, i1: usize, i2: usize) -> [u8; 4] {
         let (wa, wb, wc) = (mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]);
-        let e1 = sub(wb, wa);
-        let e2 = sub(wc, wa);
-        let n = normalize(cross(e1, e2));
-        let ndotl = (dot(n, light) * 0.5 + 0.5).clamp(0.12, 1.0);
-        let shade = [
+        let n = normalize(cross(sub(wb, wa), sub(wc, wa)));
+        let ndotl = (dot(n, self.light) * 0.5 + 0.5).clamp(0.12, 1.0);
+        [
             (DIFFUSE[0] * ndotl * 255.0) as u8,
             (DIFFUSE[1] * ndotl * 255.0) as u8,
             (DIFFUSE[2] * ndotl * 255.0) as u8,
             255,
-        ];
-        let (poly, count) = clip_near([view_verts[i0], view_verts[i1], view_verts[i2]], near);
-        for k in 1..count.saturating_sub(1) {
-            fill_triangle(
-                &mut color,
-                &mut zbuf,
-                w,
-                h,
-                to_screen(poly[0]),
-                to_screen(poly[k]),
-                to_screen(poly[k + 1]),
-                shade,
-            );
-        }
+        ]
+    }
+}
+
+impl Band<'_> {
+    fn overlaps(&self, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+        let min_y = a[1].min(b[1]).min(c[1]).floor();
+        let max_y = a[1].max(b[1]).max(c[1]).ceil();
+        max_y >= self.y0 as f32 && min_y < self.y1 as f32
     }
 
-    to_image(width, height, &color)
+    fn fill(&mut self, a: [f32; 3], b: [f32; 3], c: [f32; 3], shade: [u8; 4]) {
+        let w = self.w;
+        let min_x = a[0].min(b[0]).min(c[0]).floor().max(0.0) as i32;
+        let max_x = a[0].max(b[0]).max(c[0]).ceil().min(w as f32 - 1.0) as i32;
+        let min_y = a[1].min(b[1]).min(c[1]).floor().max(self.y0 as f32) as i32;
+        let max_y = a[1].max(b[1]).max(c[1]).ceil().min(self.y1 as f32 - 1.0) as i32;
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+        let area = edge(a, b, c);
+        if area.abs() < 1e-6 {
+            return;
+        }
+        let inv_area = 1.0 / area;
+        // Each barycentric weight is linear in x: its value at the row's
+        // first pixel center plus a per-pixel step.
+        let step = [
+            (c[1] - b[1]) * inv_area,
+            (a[1] - c[1]) * inv_area,
+            (b[1] - a[1]) * inv_area,
+        ];
+        for y in min_y..=max_y {
+            let row = ((y - self.y0) * w) as usize;
+            let p = [min_x as f32 + 0.5, y as f32 + 0.5, 0.0];
+            let start = [
+                edge(b, c, p) * inv_area,
+                edge(c, a, p) * inv_area,
+                edge(a, b, p) * inv_area,
+            ];
+            for x in min_x..=max_x {
+                let dx = (x - min_x) as f32;
+                let w0 = start[0] + dx * step[0];
+                let w1 = start[1] + dx * step[1];
+                let w2 = start[2] + dx * step[2];
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+                let inv_depth = w0 * a[2] + w1 * b[2] + w2 * c[2];
+                let idx = row + x as usize;
+                if inv_depth > self.zbuf[idx] {
+                    self.zbuf[idx] = inv_depth;
+                    self.color[idx] = shade;
+                }
+            }
+        }
+    }
 }
 
 pub fn encode_png(img: &RgbaImage) -> Vec<u8> {
@@ -131,8 +305,8 @@ fn to_image(width: u32, height: u32, color: &[[u8; 4]]) -> RgbaImage {
     if width == 0 || height == 0 {
         return RgbaImage::new(width, height);
     }
-    let raw: Vec<u8> = color.iter().flatten().copied().collect();
-    RgbaImage::from_raw(width, height, raw).expect("buffer matches dimensions")
+    RgbaImage::from_raw(width, height, color.as_flattened().to_vec())
+        .expect("buffer matches dimensions")
 }
 
 fn view_matrix(camera: &Camera, center: [f32; 3], radius: f32) -> ([[f32; 4]; 4], [f32; 3]) {
@@ -192,48 +366,6 @@ fn clip_near(tri: [[f32; 3]; 3], near: f32) -> ([[f32; 3]; 4], usize) {
         }
     }
     (out, n)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fill_triangle(
-    color: &mut [[u8; 4]],
-    zbuf: &mut [f32],
-    w: i32,
-    h: i32,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    shade: [u8; 4],
-) {
-    let min_x = a[0].min(b[0]).min(c[0]).floor().max(0.0) as i32;
-    let max_x = a[0].max(b[0]).max(c[0]).ceil().min(w as f32 - 1.0) as i32;
-    let min_y = a[1].min(b[1]).min(c[1]).floor().max(0.0) as i32;
-    let max_y = a[1].max(b[1]).max(c[1]).ceil().min(h as f32 - 1.0) as i32;
-    if min_x > max_x || min_y > max_y {
-        return;
-    }
-    let area = edge(a, b, c);
-    if area.abs() < 1e-6 {
-        return;
-    }
-    let inv_area = 1.0 / area;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) * inv_area;
-            let w1 = edge(c, a, p) * inv_area;
-            let w2 = edge(a, b, p) * inv_area;
-            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                continue;
-            }
-            let inv_depth = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            let idx = (y * w + x) as usize;
-            if inv_depth > zbuf[idx] {
-                zbuf[idx] = inv_depth;
-                color[idx] = shade;
-            }
-        }
-    }
 }
 
 fn edge(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
@@ -388,5 +520,20 @@ mod tests {
             .filter(|p| *p != BG)
             .collect();
         assert_eq!(shades.len(), 1, "saw {} shades: {shades:?}", shades.len());
+    }
+    #[test]
+    fn bands_render_the_same_image_as_one() {
+        // Odd height so the last band is shorter; zoomed in so some
+        // triangles cross the near plane and take the clipping path.
+        let mut cam = Camera::default();
+        cam.orbit(30.0, 15.0);
+        for distance in [1.8, 0.4] {
+            cam.distance = distance;
+            let one = render_mesh_bands(&unit_cube(), &cam, 61, 47, BG, 1);
+            for bands in [2, 3, 7, 47, 100] {
+                let many = render_mesh_bands(&unit_cube(), &cam, 61, 47, BG, bands);
+                assert!(one == many, "{bands} bands differ at distance {distance}");
+            }
+        }
     }
 }

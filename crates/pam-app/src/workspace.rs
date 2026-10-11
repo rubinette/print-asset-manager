@@ -122,6 +122,8 @@ pub struct Workspace {
     preview_busy: bool,
     preview_dirty: bool,
     last_preview_pos: Option<Point<Pixels>>,
+    /// The camera moved since the mouse went down, so the frame is low-poly.
+    preview_dragged: bool,
     /// Images and documents next to the selected asset.
     nearby: Nearby,
     watch: Option<WatchHandle>,
@@ -273,6 +275,7 @@ impl Workspace {
             preview_busy: false,
             preview_dirty: false,
             last_preview_pos: None,
+            preview_dragged: false,
             nearby: Nearby::default(),
             watch: WatchHandle::start().ok(),
             scan_done: 0,
