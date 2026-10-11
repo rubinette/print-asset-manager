@@ -374,7 +374,7 @@ impl<R: Read + std::io::Seek> Package<R> {
     }
 }
 
-fn attr_str(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
+pub(crate) fn attr_str(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == name)
@@ -474,6 +474,25 @@ fn parse_model_part(src: impl std::io::BufRead) -> std::result::Result<ModelPart
     }
 
     Ok(part)
+}
+
+/// A 3MF package's zip entries by normalized name (see
+/// [`normalize_part_name`]), and the name of its root model part.
+pub(crate) struct Package3mf {
+    pub archive: ZipArchive<BufReader<File>>,
+    pub entries: HashMap<String, usize>,
+    pub root: Option<String>,
+}
+
+pub(crate) fn open_3mf(path: &Path) -> Result<Package3mf> {
+    let archive = ZipArchive::new(BufReader::new(File::open(path)?))?;
+    let mut package = Package::new(archive)?;
+    let root = package.root_part();
+    Ok(Package3mf {
+        archive: package.archive,
+        entries: package.entries,
+        root,
+    })
 }
 
 /// Pull the best embedded PNG thumbnail out of a 3MF package, if any.

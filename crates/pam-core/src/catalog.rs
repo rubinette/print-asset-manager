@@ -9,9 +9,14 @@ use walkdir::WalkDir;
 use crate::error::Result;
 use crate::hash::file_sha256;
 use crate::mesh::{AssetFormat, BBox};
+use crate::print_info::{PrintInfo, PRINT_INFO_VERSION};
 
 /// Files written per scan transaction.
 const SCAN_CHUNK: usize = 500;
+/// Most new files hashed to find where one vanished file went.
+const MOVE_HASH_CANDIDATES: usize = 8;
+/// Days a vanished file's tags wait in `detached_meta` for it to reappear.
+const DETACHED_KEEP_DAYS: i64 = 90;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -57,6 +62,50 @@ CREATE TABLE IF NOT EXISTS favorites (
   asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE
 );
 
+-- Print status and note per asset. Its own table rather than assets columns:
+-- there are no migrations, and CREATE TABLE IF NOT EXISTS reaches catalogs
+-- made before it existed. A row is dropped once both are cleared.
+CREATE TABLE IF NOT EXISTS asset_notes (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+  status TEXT,
+  status_at INTEGER,
+  note TEXT NOT NULL DEFAULT ''
+);
+
+-- Slicer metadata read from 3MF files (`print_info.rs`). Every 3MF gets a
+-- row once read, empty or not, so it isn't read again; rows written by an
+-- older PRINT_INFO_VERSION are read again. `materials` is a JSON array.
+CREATE TABLE IF NOT EXISTS print_info (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  title TEXT,
+  designer TEXT,
+  application TEXT,
+  printer TEXT,
+  materials TEXT NOT NULL DEFAULT '[]',
+  print_time_s INTEGER,
+  filament_g REAL,
+  layer_height REAL
+);
+
+-- Searches saved to the sidebar. `query` is the app's own encoding of the
+-- folder, search text and filters; the catalog only stores it.
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  query TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+-- User data (tags, ...) of files that left the index, keyed by content hash,
+-- as JSON. A file moved to another library gets it back once it is hashed
+-- there. Moves inside one library keep their row instead (`relink_moved`).
+CREATE TABLE IF NOT EXISTS detached_meta (
+  content_sha256 BLOB PRIMARY KEY,
+  data TEXT NOT NULL,
+  detached_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_assets_thumb_state ON assets(thumb_state);
 CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag_id);
 CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(content_sha256);
@@ -100,6 +149,43 @@ impl ThumbState {
     }
 }
 
+/// Where an asset stands in the user's printing, set by hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrintStatus {
+    Todo,
+    Printed,
+    Failed,
+}
+
+impl PrintStatus {
+    pub const ALL: [Self; 3] = [Self::Todo, Self::Printed, Self::Failed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Printed => "printed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "todo" => Some(Self::Todo),
+            "printed" => Some(Self::Printed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// [`AssetQuery::print_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusFilter {
+    Is(PrintStatus),
+    /// No print status set.
+    Unmarked,
+}
+
 #[derive(Clone, Debug)]
 pub struct Asset {
     pub id: i64,
@@ -115,6 +201,13 @@ pub struct Asset {
     pub thumb_state: ThumbState,
     pub error: Option<String>,
     pub tags: Vec<String>,
+    pub status: Option<PrintStatus>,
+    /// Unix seconds when `status` was last set.
+    pub status_at: Option<i64>,
+    /// Free text; empty when there is none.
+    pub note: String,
+    /// Slicer metadata of a 3MF, once read; `None` for other formats.
+    pub print: Option<PrintInfo>,
     pub favorite: bool,
 }
 
@@ -287,15 +380,29 @@ pub struct AssetQuery {
     pub file_size: Option<(u64, Option<u64>)>,
     pub modified_since_ns: Option<i64>,
     pub untagged: bool,
+    pub print_status: Option<StatusFilter>,
     pub favorites_only: bool,
     /// Only assets whose content hash is shared with another asset.
     pub duplicates_only: bool,
     pub search: Option<String>,
+    /// 3MF files whose slicer settings use any of these filament types.
+    pub materials: Vec<String>,
+    /// Estimated print time range in seconds: at least `.0`, below `.1`.
+    /// Files without an estimate are left out.
+    pub print_time: Option<(u64, Option<u64>)>,
     pub thumb_state: Option<ThumbState>,
     /// Skip libraries whose root is missing (e.g. NAS offline).
     pub online_only: bool,
     pub limit: Option<usize>,
     pub sort: AssetSort,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedSearch {
+    pub id: i64,
+    pub name: String,
+    /// Opaque to the catalog; see the `saved_searches` table.
+    pub query: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -304,6 +411,8 @@ pub struct ScanStats {
     pub updated: u32,
     pub removed: u32,
     pub skipped: u32,
+    /// Files renamed or moved within the library; counted in no other field.
+    pub moved: u32,
 }
 
 pub struct Catalog {
@@ -315,16 +424,19 @@ impl Catalog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Self::init(Connection::open(path)?)
     }
 
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        conn.execute(
+            "DELETE FROM detached_meta WHERE detached_at < ?1",
+            params![now_secs() - DETACHED_KEEP_DAYS * 86_400],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -349,10 +461,15 @@ impl Catalog {
         })
     }
 
-    /// Forget a library and its assets. Files on disk are untouched.
+    /// Forget a library and its assets. Files on disk are untouched. Their
+    /// tags are kept aside, so adding the folder back (or a folder holding
+    /// the same files) restores them.
     pub fn remove_library(&self, id: i64) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // Unlike a vanished file, nothing moved: the stash waits for this
+        // folder to come back rather than going to a copy elsewhere.
+        stash_user_data(&tx, "a.library_id = ?1", id)?;
         // assets_fts is contentless and not covered by the FK cascade.
         tx.execute(
             "DELETE FROM assets_fts WHERE rowid IN (SELECT id FROM assets WHERE library_id = ?1)",
@@ -406,6 +523,7 @@ impl Catalog {
         on_progress(0, total);
 
         let mut seen = HashSet::new();
+        let mut added = Vec::new();
         let mut done = 0u32;
         // Stat outside the lock, then write each chunk in one transaction so
         // queries from the UI thread can interleave between chunks.
@@ -425,8 +543,18 @@ impl Catalog {
             {
                 let mut conn = self.conn.lock().unwrap();
                 let tx = conn.transaction()?;
-                for (rel, format, size, mtime) in &entries {
-                    upsert_asset(&tx, library.id, rel, *format, *size, *mtime, &mut stats)?;
+                for (rel, format, size, mtime) in entries {
+                    if let Some(id) =
+                        upsert_asset(&tx, library.id, &rel, format, size, mtime, &mut stats)?
+                    {
+                        added.push(ScannedFile {
+                            id,
+                            rel,
+                            format: format.as_str().to_string(),
+                            size,
+                            mtime,
+                        });
+                    }
                 }
                 tx.commit()?;
             }
@@ -434,23 +562,52 @@ impl Catalog {
             on_progress(done, total);
         }
 
+        let gone: Vec<GoneFile> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, rel_path, format, size_bytes, mtime_ns, content_sha256
+                 FROM assets WHERE library_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![library.id], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    GoneFile {
+                        id: r.get(0)?,
+                        format: r.get(2)?,
+                        size: r.get(3)?,
+                        mtime: r.get(4)?,
+                        sha: r.get(5)?,
+                    },
+                ))
+            })?;
+            rows.filter_map(|r| r.ok())
+                .filter(|(rel, _)| !seen.contains(rel))
+                .map(|(_, gone)| gone)
+                .collect()
+        };
+        // Hashing reads files, so match moves before taking the lock.
+        let moves = plan_moves(&gone, &added, |file| {
+            file_sha256(&library.root_path.join(&file.rel)).ok()
+        });
+
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare("SELECT id, rel_path FROM assets WHERE library_id = ?1")?;
-        let stale: Vec<i64> = stmt
-            .query_map(params![library.id], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .filter(|(_, rel)| !seen.contains(rel))
-            .map(|(id, _)| id)
-            .collect();
-        drop(stmt);
-        for id in stale {
-            let _ = tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![id]);
-            tx.execute("DELETE FROM assets WHERE id = ?1", params![id])?;
+        let mut moved = HashSet::new();
+        for &(old_id, new_id) in &moves {
+            if relink_moved(&tx, old_id, new_id)? {
+                moved.insert(old_id);
+                stats.added -= 1;
+                stats.moved += 1;
+            }
+        }
+        let mut stashed = Vec::new();
+        for file in gone.iter().filter(|g| !moved.contains(&g.id)) {
+            stashed.extend(stash_user_data(&tx, "a.id = ?1", file.id)?);
+            let _ = tx.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![file.id]);
+            tx.execute("DELETE FROM assets WHERE id = ?1", params![file.id])?;
             stats.removed += 1;
         }
+        reattach_to_indexed_copy(&tx, &stashed)?;
         tx.commit()?;
         Ok(stats)
     }
@@ -464,101 +621,7 @@ impl Catalog {
         let conn = self.conn.lock().unwrap();
         let mut sql = format!("{SELECT_ASSETS} WHERE 1=1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
-        if let Some(id) = query.library_id {
-            sql.push_str(" AND a.library_id = ?");
-            args.push(id.into());
-        }
-        if let Some(dir) = query.dir.as_deref().map(|d| d.trim_matches('/')) {
-            if !dir.is_empty() {
-                sql.push_str(" AND a.rel_path LIKE ? ESCAPE '\\'");
-                args.push(format!("{}/%", escape_like(dir)).into());
-            }
-        }
-        if !query.tags.is_empty() {
-            sql.push_str(&format!(
-                " AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
-                   WHERE t.name IN ({}) GROUP BY at.asset_id",
-                placeholders(query.tags.len())
-            ));
-            args.extend(query.tags.iter().map(|t| t.clone().into()));
-            if query.tag_mode == TagMode::All {
-                sql.push_str(" HAVING COUNT(DISTINCT t.id) = ?");
-                let distinct: HashSet<&String> = query.tags.iter().collect();
-                args.push((distinct.len() as i64).into());
-            }
-            sql.push(')');
-        }
-        if query.untagged {
-            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
-        }
-        if query.favorites_only {
-            sql.push_str(" AND a.id IN (SELECT asset_id FROM favorites)");
-        }
-        if !query.formats.is_empty() {
-            sql.push_str(&format!(
-                " AND a.format IN ({})",
-                placeholders(query.formats.len())
-            ));
-            args.extend(query.formats.iter().map(|f| f.as_str().to_string().into()));
-        }
-        if let Some([x, y, z]) = query.fits_bed {
-            sql.push_str(
-                " AND a.bbox_min_x IS NOT NULL
-                  AND (a.bbox_max_z - a.bbox_min_z) <= ?
-                  AND (((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?)
-                    OR ((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?))",
-            );
-            for v in [z, x, y, y, x] {
-                args.push(f64::from(v).into());
-            }
-        }
-        if let Some((min, max)) = query.file_size {
-            sql.push_str(" AND a.size_bytes >= ?");
-            args.push((min as i64).into());
-            if let Some(max) = max {
-                sql.push_str(" AND a.size_bytes < ?");
-                args.push((max as i64).into());
-            }
-        }
-        if let Some(since) = query.modified_since_ns {
-            sql.push_str(" AND a.mtime_ns >= ?");
-            args.push(since.into());
-        }
-        if query.duplicates_only {
-            sql.push_str(
-                " AND a.content_sha256 IN (
-                    SELECT content_sha256 FROM assets WHERE content_sha256 IS NOT NULL
-                    GROUP BY content_sha256 HAVING COUNT(*) > 1)",
-            );
-        }
-        if let Some(search) = query.search.as_ref().map(|s| s.trim().to_string()) {
-            if !search.is_empty() {
-                let like = format!("%{}%", escape_like(&search));
-                sql.push_str(
-                    " AND (a.rel_path LIKE ? ESCAPE '\\' OR a.id IN (
-                        SELECT at.asset_id FROM asset_tags at
-                        JOIN tags t ON t.id = at.tag_id
-                        WHERE t.name LIKE ? ESCAPE '\\'
-                      ) OR a.id IN (
-                        SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
-                      ))",
-                );
-                args.push(like.clone().into());
-                args.push(like.into());
-                args.push(fts_query(&search).into());
-            }
-        }
-        if let Some(state) = query.thumb_state {
-            sql.push_str(" AND a.thumb_state = ?");
-            args.push(state.as_str().to_string().into());
-        }
-        if let Some(ids) = online {
-            sql.push_str(&format!(
-                " AND a.library_id IN ({})",
-                placeholders(ids.len())
-            ));
-            args.extend(ids.into_iter().map(Into::into));
-        }
+        push_query_filters(query, online, &mut sql, &mut args);
         query.sort.push_order_by(&mut sql, query.duplicates_only);
         if let Some(limit) = query.limit {
             sql.push_str(" LIMIT ?");
@@ -602,6 +665,21 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    /// How many assets [`Self::assets`] would return, ignoring `limit`.
+    pub fn count(&self, query: &AssetQuery) -> Result<u32> {
+        let online = if query.online_only {
+            Some(self.online_library_ids()?)
+        } else {
+            None
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from("SELECT COUNT(*) FROM assets a WHERE 1=1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        push_query_filters(query, online, &mut sql, &mut args);
+        let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |r| r.get(0))?;
+        Ok(n as u32)
     }
 
     /// Libraries whose root is currently reachable.
@@ -653,6 +731,67 @@ impl Catalog {
         args.push((limit as i64).into());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args), asset_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Up to `limit` 3MF assets in online libraries whose slicer metadata
+    /// hasn't been read (or was read by an older version), in id order after
+    /// `after_id`, like [`Self::unhashed_assets`].
+    pub fn assets_without_print_info(&self, after_id: i64, limit: usize) -> Result<Vec<Asset>> {
+        let online = self.online_library_ids()?;
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "{SELECT_ASSETS} WHERE a.format = 'threemf' AND a.id > ?
+               AND (p.asset_id IS NULL OR p.version < ?)
+               AND a.library_id IN ({}) ORDER BY a.id LIMIT ?",
+            placeholders(online.len())
+        );
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![after_id.into(), PRINT_INFO_VERSION.into()];
+        args.extend(online.into_iter().map(Into::into));
+        args.push((limit as i64).into());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), asset_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Store what was read from `asset`'s file, unless a scan has seen the
+    /// file change since `asset` was read (as in [`Self::hash_asset`]).
+    pub fn set_print_info(&self, asset: &Asset, info: &PrintInfo) -> Result<()> {
+        let materials = serde_json::to_string(&info.materials).unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO print_info (asset_id, version, title, designer, application,
+                 printer, materials, print_time_s, filament_g, layer_height)
+             SELECT id, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 FROM assets
+             WHERE id = ?1 AND size_bytes = ?2 AND mtime_ns = ?3",
+            params![
+                asset.id,
+                asset.size_bytes as i64,
+                asset.mtime_ns,
+                PRINT_INFO_VERSION,
+                info.title,
+                info.designer,
+                info.application,
+                info.printer,
+                materials,
+                info.print_time_s.map(|s| s as i64),
+                info.filament_g,
+                info.layer_height_mm,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Filament types found in 3MF files, with how many files use each,
+    /// most used first.
+    pub fn all_materials(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.value, COUNT(*) FROM print_info p, json_each(p.materials) m
+             GROUP BY m.value ORDER BY COUNT(*) DESC, m.value",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -740,13 +879,21 @@ impl Catalog {
     /// Hash `asset`'s file and store the hash, unless a scan has seen the file
     /// change since `asset` was read: the row then has a new size or mtime,
     /// and a hash of the old contents must not land on it.
+    ///
+    /// A file that left the index with tags (moved out of another library)
+    /// gets them back here, if this asset has none of its own yet.
     pub fn hash_asset(&self, asset: &Asset) -> Result<Vec<u8>> {
         let sha = file_sha256(&asset.abs_path())?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let stored = tx.execute(
             "UPDATE assets SET content_sha256=?1 WHERE id=?2 AND size_bytes=?3 AND mtime_ns=?4",
             params![&sha[..], asset.id, asset.size_bytes as i64, asset.mtime_ns],
         )?;
+        if stored > 0 {
+            reattach_user_data(&tx, asset.id, &sha)?;
+        }
+        tx.commit()?;
         Ok(sha.to_vec())
     }
 
@@ -831,6 +978,87 @@ impl Catalog {
         Ok(n as u32)
     }
 
+    /// Set (or with `None` clear) the print status of every asset in `ids`.
+    pub fn set_status(&self, ids: &[i64], status: Option<PrintStatus>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = now_secs();
+        for &id in ids {
+            tx.execute(
+                "INSERT INTO asset_notes (asset_id, status, status_at)
+                 SELECT id, ?2, ?3 FROM assets WHERE id = ?1
+                 ON CONFLICT (asset_id) DO UPDATE
+                   SET status = excluded.status, status_at = excluded.status_at",
+                params![id, status.map(PrintStatus::as_str), status.map(|_| now)],
+            )?;
+            drop_empty_notes(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace an asset's note. A blank note clears it.
+    pub fn set_note(&self, id: i64, note: &str) -> Result<()> {
+        let note = if note.trim().is_empty() { "" } else { note };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO asset_notes (asset_id, note) SELECT id, ?2 FROM assets WHERE id = ?1
+             ON CONFLICT (asset_id) DO UPDATE SET note = excluded.note",
+            params![id, note],
+        )?;
+        drop_empty_notes(&conn, id)?;
+        Ok(())
+    }
+
+    /// Saved searches by name.
+    pub fn saved_searches(&self) -> Result<Vec<SavedSearch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, query FROM saved_searches ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SavedSearch {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                query: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn add_saved_search(&self, name: &str, query: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO saved_searches (name, query, created_at) VALUES (?1, ?2, ?3)",
+            params![name.trim(), query, now_secs()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn rename_saved_search(&self, id: i64, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE saved_searches SET name = ?2 WHERE id = ?1",
+            params![id, name.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_saved_search_query(&self, id: i64, query: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE saved_searches SET query = ?2 WHERE id = ?1",
+            params![id, query],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_saved_search(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM saved_searches WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Relative paths of every asset in a library, for building its folder tree.
     pub fn rel_paths(&self, library_id: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
@@ -864,15 +1092,160 @@ impl Catalog {
     }
 }
 
+/// Append `query`'s conditions (all on `assets a`) to `sql`, a statement
+/// ending in a `WHERE` clause, and their values to `args`. `online` lists
+/// the reachable libraries when the query asks for online ones only.
+fn push_query_filters(
+    query: &AssetQuery,
+    online: Option<Vec<i64>>,
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+) {
+    if let Some(id) = query.library_id {
+        sql.push_str(" AND a.library_id = ?");
+        args.push(id.into());
+    }
+    if let Some(dir) = query.dir.as_deref().map(|d| d.trim_matches('/')) {
+        if !dir.is_empty() {
+            sql.push_str(" AND a.rel_path LIKE ? ESCAPE '\\'");
+            args.push(format!("{}/%", escape_like(dir)).into());
+        }
+    }
+    if !query.tags.is_empty() {
+        sql.push_str(&format!(
+            " AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+               WHERE t.name IN ({}) GROUP BY at.asset_id",
+            placeholders(query.tags.len())
+        ));
+        args.extend(query.tags.iter().map(|t| t.clone().into()));
+        if query.tag_mode == TagMode::All {
+            sql.push_str(" HAVING COUNT(DISTINCT t.id) = ?");
+            let distinct: HashSet<&String> = query.tags.iter().collect();
+            args.push((distinct.len() as i64).into());
+        }
+        sql.push(')');
+    }
+    if query.untagged {
+        sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
+    }
+    if query.favorites_only {
+        sql.push_str(" AND a.id IN (SELECT asset_id FROM favorites)");
+    }
+    match query.print_status {
+        Some(StatusFilter::Is(status)) => {
+            sql.push_str(" AND a.id IN (SELECT asset_id FROM asset_notes WHERE status = ?)");
+            args.push(status.as_str().to_string().into());
+        }
+        Some(StatusFilter::Unmarked) => sql.push_str(
+            " AND a.id NOT IN (SELECT asset_id FROM asset_notes WHERE status IS NOT NULL)",
+        ),
+        None => {}
+    }
+    if !query.formats.is_empty() {
+        sql.push_str(&format!(
+            " AND a.format IN ({})",
+            placeholders(query.formats.len())
+        ));
+        args.extend(query.formats.iter().map(|f| f.as_str().to_string().into()));
+    }
+    if let Some([x, y, z]) = query.fits_bed {
+        sql.push_str(
+            " AND a.bbox_min_x IS NOT NULL
+              AND (a.bbox_max_z - a.bbox_min_z) <= ?
+              AND (((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?)
+                OR ((a.bbox_max_x - a.bbox_min_x) <= ? AND (a.bbox_max_y - a.bbox_min_y) <= ?))",
+        );
+        for v in [z, x, y, y, x] {
+            args.push(f64::from(v).into());
+        }
+    }
+    if let Some((min, max)) = query.file_size {
+        sql.push_str(" AND a.size_bytes >= ?");
+        args.push((min as i64).into());
+        if let Some(max) = max {
+            sql.push_str(" AND a.size_bytes < ?");
+            args.push((max as i64).into());
+        }
+    }
+    if let Some(since) = query.modified_since_ns {
+        sql.push_str(" AND a.mtime_ns >= ?");
+        args.push(since.into());
+    }
+    if query.duplicates_only {
+        sql.push_str(
+            " AND a.content_sha256 IN (
+                SELECT content_sha256 FROM assets WHERE content_sha256 IS NOT NULL
+                GROUP BY content_sha256 HAVING COUNT(*) > 1)",
+        );
+    }
+    if let Some(search) = query.search.as_ref().map(|s| s.trim().to_string()) {
+        if !search.is_empty() {
+            let like = format!("%{}%", escape_like(&search));
+            sql.push_str(
+                " AND (a.rel_path LIKE ? ESCAPE '\\' OR a.id IN (
+                    SELECT at.asset_id FROM asset_tags at
+                    JOIN tags t ON t.id = at.tag_id
+                    WHERE t.name LIKE ? ESCAPE '\\'
+                  ) OR a.id IN (
+                    SELECT asset_id FROM asset_notes WHERE note LIKE ? ESCAPE '\\'
+                  ) OR a.id IN (
+                    SELECT asset_id FROM print_info
+                    WHERE COALESCE(title, '') || ' ' || COALESCE(designer, '') || ' '
+                          || COALESCE(printer, '') || ' ' || materials LIKE ? ESCAPE '\\'
+                  ) OR a.id IN (
+                    SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?
+                  ))",
+            );
+            args.push(like.clone().into());
+            args.push(like.clone().into());
+            args.push(like.clone().into());
+            args.push(like.into());
+            args.push(fts_query(&search).into());
+        }
+    }
+    if !query.materials.is_empty() {
+        sql.push_str(&format!(
+            " AND a.id IN (SELECT p.asset_id FROM print_info p, json_each(p.materials) m
+               WHERE m.value IN ({}))",
+            placeholders(query.materials.len())
+        ));
+        args.extend(query.materials.iter().map(|m| m.clone().into()));
+    }
+    if let Some((min, max)) = query.print_time {
+        sql.push_str(" AND a.id IN (SELECT asset_id FROM print_info WHERE print_time_s >= ?");
+        args.push((min as i64).into());
+        if let Some(max) = max {
+            sql.push_str(" AND print_time_s < ?");
+            args.push((max as i64).into());
+        }
+        sql.push(')');
+    }
+    if let Some(state) = query.thumb_state {
+        sql.push_str(" AND a.thumb_state = ?");
+        args.push(state.as_str().to_string().into());
+    }
+    if let Some(ids) = online {
+        sql.push_str(&format!(
+            " AND a.library_id IN ({})",
+            placeholders(ids.len())
+        ));
+        args.extend(ids.into_iter().map(Into::into));
+    }
+}
+
 /// The columns [`asset_from_row`] reads; callers append the `WHERE` clause.
 const SELECT_ASSETS: &str = "SELECT a.id, a.library_id, l.root_path, a.rel_path, a.format,
         a.size_bytes, a.mtime_ns, a.content_sha256, a.triangle_count,
         a.bbox_min_x, a.bbox_min_y, a.bbox_min_z,
         a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
-        a.thumb_state, a.error,
+        a.thumb_state, a.error, n.status, n.status_at, COALESCE(n.note, ''),
+        p.asset_id, p.title, p.designer, p.application, p.printer, p.materials,
+        p.print_time_s, p.filament_g, p.layer_height,
         EXISTS (SELECT 1 FROM favorites f WHERE f.asset_id = a.id)
  FROM assets a
- JOIN libraries l ON l.id = a.library_id";
+ JOIN libraries l ON l.id = a.library_id
+ LEFT JOIN asset_notes n ON n.asset_id = a.id
+ LEFT JOIN print_info p ON p.asset_id = a.id";
 
 /// An [`Asset`] from a [`SELECT_ASSETS`] row, without its tags.
 fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
@@ -905,8 +1278,39 @@ fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
         thumb_state: ThumbState::parse(&r.get::<_, String>(15)?),
         error: r.get(16)?,
         tags: Vec::new(),
-        favorite: r.get(17)?,
+        status: r
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(PrintStatus::parse),
+        status_at: r.get(18)?,
+        note: r.get(19)?,
+        print: match r.get::<_, Option<i64>>(20)? {
+            None => None,
+            Some(_) => Some(PrintInfo {
+                title: r.get(21)?,
+                designer: r.get(22)?,
+                application: r.get(23)?,
+                printer: r.get(24)?,
+                materials: r
+                    .get::<_, Option<String>>(25)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
+                print_time_s: r.get::<_, Option<i64>>(26)?.map(|s| s.max(0) as u64),
+                filament_g: r.get(27)?,
+                layer_height_mm: r.get(28)?,
+            }),
+        },
+        favorite: r.get(29)?,
     })
+}
+
+/// Drop an asset's `asset_notes` row once it holds neither status nor note.
+fn drop_empty_notes(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM asset_notes WHERE asset_id = ?1 AND status IS NULL AND note = ''",
+        params![id],
+    )?;
+    Ok(())
 }
 
 /// Attach one tag (created if new) to an asset. Blank names are ignored.
@@ -962,7 +1366,7 @@ fn upsert_asset(
     size: i64,
     mtime: i64,
     stats: &mut ScanStats,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     let existing: Option<(i64, i64, i64)> = conn
         .query_row(
             "SELECT id, size_bytes, mtime_ns FROM assets WHERE library_id = ?1 AND rel_path = ?2",
@@ -981,6 +1385,7 @@ fn upsert_asset(
                  WHERE id=?4",
                 params![format.as_str(), size, mtime, id],
             )?;
+            conn.execute("DELETE FROM print_info WHERE asset_id = ?1", params![id])?;
             stats.updated += 1;
         }
         None => {
@@ -999,8 +1404,238 @@ fn upsert_asset(
                 params![id, name, rel],
             );
             stats.added += 1;
+            return Ok(Some(id));
         }
     }
+    Ok(None)
+}
+
+/// A file a scan added to the index.
+struct ScannedFile {
+    id: i64,
+    rel: String,
+    format: String,
+    size: i64,
+    mtime: i64,
+}
+
+/// An indexed file a scan no longer found.
+struct GoneFile {
+    id: i64,
+    format: String,
+    size: i64,
+    mtime: i64,
+    sha: Option<Vec<u8>>,
+}
+
+/// Pair files that vanished with files that appeared in the same scan, as
+/// (gone id, added id), when they are the same file renamed or moved:
+///
+/// - the one gone file and the one added file with a given size, mtime and
+///   format (the test a scan already uses to call a file unchanged), or
+/// - an added file with the gone file's size and format whose content hash
+///   (from `hash`) matches the gone file's stored hash, e.g. moved by a copy
+///   that reset its mtime.
+fn plan_moves(
+    gone: &[GoneFile],
+    added: &[ScannedFile],
+    mut hash: impl FnMut(&ScannedFile) -> Option<[u8; 32]>,
+) -> Vec<(i64, i64)> {
+    type Key<'a> = (i64, i64, &'a str);
+    let mut gone_by_key: HashMap<Key, Vec<&GoneFile>> = HashMap::new();
+    for g in gone {
+        gone_by_key
+            .entry((g.size, g.mtime, &g.format))
+            .or_default()
+            .push(g);
+    }
+    let mut added_by_key: HashMap<Key, Vec<&ScannedFile>> = HashMap::new();
+    for a in added {
+        added_by_key
+            .entry((a.size, a.mtime, &a.format))
+            .or_default()
+            .push(a);
+    }
+
+    let mut moves = Vec::new();
+    let mut matched_gone = HashSet::new();
+    let mut claimed = HashSet::new();
+    for (key, gs) in &gone_by_key {
+        if let (&[g], Some(&[a])) = (gs.as_slice(), added_by_key.get(key).map(Vec::as_slice)) {
+            moves.push((g.id, a.id));
+            matched_gone.insert(g.id);
+            claimed.insert(a.id);
+        }
+    }
+
+    let mut hashes: HashMap<i64, Option<[u8; 32]>> = HashMap::new();
+    for g in gone.iter().filter(|g| !matched_gone.contains(&g.id)) {
+        let Some(sha) = g.sha.as_deref() else {
+            continue;
+        };
+        let mut candidates: Vec<&ScannedFile> = added
+            .iter()
+            .filter(|a| !claimed.contains(&a.id) && a.size == g.size && a.format == g.format)
+            .collect();
+        // Same mtime first: likeliest to be this file.
+        candidates.sort_by_key(|a| a.mtime != g.mtime);
+        for a in candidates.into_iter().take(MOVE_HASH_CANDIDATES) {
+            let found = *hashes.entry(a.id).or_insert_with(|| hash(a));
+            if found.is_some_and(|h| h[..] == *sha) {
+                moves.push((g.id, a.id));
+                claimed.insert(a.id);
+                break;
+            }
+        }
+    }
+    moves
+}
+
+/// Point the row of a vanished file (`old_id`) at the file it was moved to,
+/// and drop the row the scan had just added for that file (`new_id`). The
+/// old row keeps its id, so its tags, thumbnail and everything else keyed
+/// by asset id stay with the file. Returns false if either row is gone.
+fn relink_moved(conn: &Connection, old_id: i64, new_id: i64) -> Result<bool> {
+    let new: Option<(String, String, i64, i64)> = conn
+        .query_row(
+            "SELECT rel_path, format, size_bytes, mtime_ns FROM assets WHERE id = ?1",
+            params![new_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let old_exists = conn
+        .query_row(
+            "SELECT 1 FROM assets WHERE id = ?1",
+            params![old_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let (Some((rel, format, size, mtime)), true) = (new, old_exists) else {
+        return Ok(false);
+    };
+    // Tags someone added to the new row in the meantime come along.
+    conn.execute(
+        "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id)
+         SELECT ?1, tag_id FROM asset_tags WHERE asset_id = ?2",
+        params![old_id, new_id],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO favorites (asset_id)
+         SELECT ?1 FROM favorites WHERE asset_id = ?2",
+        params![old_id, new_id],
+    )?;
+    let _ = conn.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![new_id]);
+    conn.execute("DELETE FROM assets WHERE id = ?1", params![new_id])?;
+    conn.execute(
+        "UPDATE assets SET rel_path = ?1, format = ?2, size_bytes = ?3, mtime_ns = ?4
+         WHERE id = ?5",
+        params![rel, format, size, mtime, old_id],
+    )?;
+    refresh_fts(conn, old_id)?;
+    Ok(true)
+}
+
+/// Keep aside the user data of the assets matching `condition` (SQL on
+/// `assets a`, with `?1` bound to `arg`) before they leave the index, keyed
+/// by content hash. Assets without a hash or without user data are skipped.
+/// Returns the hashes stashed.
+fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<Vec<Vec<u8>>> {
+    let mut stmt = conn.prepare(&format!(
+        "INSERT OR REPLACE INTO detached_meta (content_sha256, data, detached_at)
+             SELECT a.content_sha256, json_object(
+                 'tags', json((SELECT json_group_array(t.name) FROM asset_tags at
+                               JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = a.id)),
+                 'status', n.status, 'status_at', n.status_at, 'note', n.note,
+                 'favorite', json(CASE WHEN f.asset_id IS NULL THEN 'false' ELSE 'true' END)
+               ), ?2
+             FROM assets a
+             LEFT JOIN asset_notes n ON n.asset_id = a.id
+             LEFT JOIN favorites f ON f.asset_id = a.id
+             WHERE ({condition}) AND a.content_sha256 IS NOT NULL
+               AND (n.asset_id IS NOT NULL OR f.asset_id IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id))
+             RETURNING content_sha256"
+    ))?;
+    let shas = stmt
+        .query_map(params![arg, now_secs()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(shas)
+}
+
+/// Give the stashes for `shas` to a copy that is already indexed and hashed:
+/// a file moved into a library that was scanned and hashed before the
+/// original's library noticed it was gone, so `hash_asset` won't see it
+/// again. The newest copy without user data of its own gets it.
+fn reattach_to_indexed_copy(conn: &Connection, shas: &[Vec<u8>]) -> Result<()> {
+    for sha in shas {
+        let copy: Option<i64> = conn
+            .query_row(
+                "SELECT a.id FROM assets a
+                 WHERE a.content_sha256 = ?1
+                   AND NOT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = a.id)
+                   AND NOT EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = a.id)
+                   AND NOT EXISTS (SELECT 1 FROM favorites WHERE asset_id = a.id)
+                 ORDER BY a.id DESC LIMIT 1",
+                params![sha],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = copy {
+            reattach_user_data(conn, id, sha)?;
+        }
+    }
+    Ok(())
+}
+
+/// Give asset `id` the user data stashed for content hash `sha`, if any and
+/// if the asset has none of its own. The stash is used up either way, so
+/// only one copy of the file gets it.
+fn reattach_user_data(conn: &Connection, id: i64, sha: &[u8]) -> Result<()> {
+    let Some(data) = conn
+        .query_row(
+            "SELECT data FROM detached_meta WHERE content_sha256 = ?1",
+            params![sha],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let has_own: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = ?1)
+             OR EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = ?1)
+             OR EXISTS (SELECT 1 FROM favorites WHERE asset_id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if !has_own {
+        let mut stmt = conn.prepare("SELECT value FROM json_each(?1, '$.tags')")?;
+        let tags: Vec<String> = stmt
+            .query_map(params![data], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for tag in &tags {
+            insert_asset_tag(conn, id, tag)?;
+        }
+        refresh_fts(conn, id)?;
+        conn.execute(
+            "INSERT INTO asset_notes (asset_id, status, status_at, note)
+             SELECT ?1, json_extract(?2, '$.status'), json_extract(?2, '$.status_at'),
+                    COALESCE(json_extract(?2, '$.note'), '')",
+            params![id, data],
+        )?;
+        drop_empty_notes(conn, id)?;
+        // Stashes from before favorites existed have no `favorite` key.
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites (asset_id)
+             SELECT ?1 WHERE json_extract(?2, '$.favorite') = 1",
+            params![id, data],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM detached_meta WHERE content_sha256 = ?1",
+        params![sha],
+    )?;
     Ok(())
 }
 
@@ -1920,6 +2555,639 @@ mod tests {
         // Other tags survive, and FTS still has them.
         assert_eq!(search("keep"), ["a.stl"]);
         assert_eq!(fts_rows(&cat), 3);
+    }
+
+    fn tags_of(cat: &Catalog, rel: &str) -> Vec<String> {
+        cat.assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|a| a.rel_path == rel)
+            .map(|a| a.tags)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rename_and_move_keep_the_row_tags_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl"]);
+        let a = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "a.stl")
+            .unwrap();
+        let sha = cat.hash_asset(&a).unwrap();
+        cat.set_thumb_state(a.id, ThumbState::Ready, None).unwrap();
+        cat.set_tags(a.id, &["boat".into()]).unwrap();
+
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::rename(dir.path().join("a.stl"), dir.path().join("sub/renamed.stl")).unwrap();
+        let stats = cat.scan_library(&lib).unwrap();
+        assert_eq!((stats.moved, stats.added, stats.removed), (1, 0, 0));
+
+        let moved = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "sub/renamed.stl")
+            .unwrap();
+        assert_eq!(moved.id, ids["a.stl"]);
+        assert_eq!(moved.tags, ["boat"]);
+        assert_eq!(moved.content_sha256.as_deref(), Some(&sha[..]));
+        assert_eq!(moved.thumb_state, ThumbState::Ready);
+        assert_eq!(fts_rows(&cat), 2);
+        let search = |q: &str| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    search: Some(q.into()),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(search("renamed"), ["sub/renamed.stl"]);
+        assert_eq!(search("boat"), ["sub/renamed.stl"]);
+        assert!(cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .iter()
+            .all(|x| x.rel_path != "a.stl"));
+    }
+
+    #[test]
+    fn move_that_changed_mtime_is_matched_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.stl"), "solid a\nendsolid a\n").unwrap();
+        fs::write(root.join("unhashed.stl"), "solid u\nendsolid u\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib = cat.add_library(root).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let by_rel = |rel: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|x| x.rel_path == rel)
+        };
+        let a = by_rel("a.stl").unwrap();
+        cat.hash_asset(&a).unwrap();
+        cat.set_tags(a.id, &["kept".into()]).unwrap();
+        let u = by_rel("unhashed.stl").unwrap();
+        cat.set_tags(u.id, &["lost".into()]).unwrap();
+
+        // Copy-then-delete moves give the new file a new mtime.
+        for (from, to, secs) in [("a.stl", "b.stl", 1_000), ("unhashed.stl", "v.stl", 2_000)] {
+            fs::copy(root.join(from), root.join(to)).unwrap();
+            set_mtime(&root.join(to), secs);
+            fs::remove_file(root.join(from)).unwrap();
+        }
+        let stats = cat.scan_library(&lib).unwrap();
+        assert_eq!((stats.moved, stats.added, stats.removed), (1, 1, 1));
+        assert_eq!(by_rel("b.stl").unwrap().id, a.id);
+        assert_eq!(tags_of(&cat, "b.stl"), ["kept"]);
+        // No hash to confirm it by, and the mtime changed: a new asset.
+        assert!(tags_of(&cat, "v.stl").is_empty());
+    }
+
+    #[test]
+    fn identical_files_moved_together_keep_their_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (cat, lib, _) = catalog_with(root, &["one.stl", "two.stl"]);
+        for (rel, secs) in [("one.stl", 5_000), ("two.stl", 5_000)] {
+            set_mtime(&root.join(rel), secs);
+        }
+        cat.scan_library(&lib).unwrap();
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            cat.hash_asset(&asset).unwrap();
+            cat.set_tags(asset.id, &[asset.rel_path.replace(".stl", "")])
+                .unwrap();
+        }
+        fs::create_dir(root.join("moved")).unwrap();
+        for rel in ["one.stl", "two.stl"] {
+            fs::rename(root.join(rel), root.join("moved").join(rel)).unwrap();
+        }
+        let stats = cat.scan_library(&lib).unwrap();
+        // Same size and mtime: ambiguous, so the hash pairs them up.
+        assert_eq!((stats.moved, stats.added, stats.removed), (2, 0, 0));
+        let mut tags: Vec<String> = ["moved/one.stl", "moved/two.stl"]
+            .into_iter()
+            .flat_map(|rel| tags_of(&cat, rel))
+            .collect();
+        tags.sort();
+        assert_eq!(tags, ["one", "two"]);
+    }
+
+    #[test]
+    fn tags_follow_a_file_into_another_library_once() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("boat.stl"), "solid boat\nendsolid boat\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let boat = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&boat).unwrap();
+        cat.set_tags(boat.id, &["boat".into(), "校準".into()])
+            .unwrap();
+
+        fs::copy(a.path().join("boat.stl"), b.path().join("boat.stl")).unwrap();
+        fs::copy(a.path().join("boat.stl"), b.path().join("copy.stl")).unwrap();
+        fs::remove_file(a.path().join("boat.stl")).unwrap();
+        assert_eq!(cat.scan_library(&lib_a).unwrap().removed, 1);
+        cat.scan_library(&lib_b).unwrap();
+        assert!(tags_of(&cat, "boat.stl").is_empty(), "not hashed yet");
+
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            cat.hash_asset(&asset).unwrap();
+        }
+        let tagged: Vec<Vec<String>> = ["boat.stl", "copy.stl"]
+            .into_iter()
+            .map(|rel| tags_of(&cat, rel))
+            .collect();
+        // Whichever copy was hashed first got the tags; the other did not.
+        assert_eq!(tagged.iter().filter(|t| !t.is_empty()).count(), 1);
+        assert!(tagged.contains(&vec!["boat".to_string(), "校準".to_string()]));
+        assert_eq!(
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    search: Some("校準".into()),
+                    ..Default::default()
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tags_reach_a_copy_hashed_before_the_original_left() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("boat.stl"), "solid boat\nendsolid boat\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let boat = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&boat).unwrap();
+        cat.set_tags(boat.id, &["boat".into()]).unwrap();
+        cat.set_status(&[boat.id], Some(PrintStatus::Printed))
+            .unwrap();
+
+        // Copy-then-delete across volumes: the copy is scanned and hashed
+        // before the source library sees the original go.
+        fs::copy(a.path().join("boat.stl"), b.path().join("moved.stl")).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        let moved = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "moved.stl")
+            .unwrap();
+        cat.hash_asset(&moved).unwrap();
+        assert!(tags_of(&cat, "moved.stl").is_empty());
+
+        fs::remove_file(a.path().join("boat.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let moved = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        assert_eq!(moved.rel_path, "moved.stl");
+        assert_eq!(moved.tags, ["boat"]);
+        assert_eq!(moved.status, Some(PrintStatus::Printed));
+        let stashes: i64 = cat
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM detached_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stashes, 0);
+    }
+
+    #[test]
+    fn removed_library_gets_its_tags_back_when_added_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, ids) = catalog_with(dir.path(), &["a.stl"]);
+        let a = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&a).unwrap();
+        cat.set_tags(ids["a.stl"], &["keep".into()]).unwrap();
+        cat.remove_library(lib.id).unwrap();
+
+        let lib = cat.add_library(dir.path()).unwrap();
+        cat.scan_library(&lib).unwrap();
+        let a = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        assert!(a.tags.is_empty());
+        cat.hash_asset(&a).unwrap();
+        assert_eq!(tags_of(&cat, "a.stl"), ["keep"]);
+    }
+
+    #[test]
+    fn stashed_tags_never_overwrite_an_assets_own_tags() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("x.stl"), "solid x\nendsolid x\n").unwrap();
+        fs::write(b.path().join("x.stl"), "solid x\nendsolid x\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        for asset in cat.assets(&AssetQuery::default()).unwrap() {
+            let tag = if asset.library_id == lib_a.id {
+                "old"
+            } else {
+                "mine"
+            };
+            cat.set_tags(asset.id, &[tag.into()]).unwrap();
+            if asset.library_id == lib_a.id {
+                cat.hash_asset(&asset).unwrap();
+            }
+        }
+        fs::remove_file(a.path().join("x.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let mine = cat.assets(&AssetQuery::default()).unwrap().pop().unwrap();
+        cat.hash_asset(&mine).unwrap();
+        assert_eq!(tags_of(&cat, "x.stl"), ["mine"]);
+    }
+
+    #[test]
+    fn print_status_and_notes_filter_search_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "c.stl"]);
+        let with_status = |filter| {
+            rel_paths_of(
+                &cat,
+                AssetQuery {
+                    print_status: Some(filter),
+                    ..Default::default()
+                },
+            )
+        };
+        cat.set_status(&[ids["a.stl"], ids["b.stl"]], Some(PrintStatus::Todo))
+            .unwrap();
+        cat.set_status(&[ids["b.stl"], 9_999], Some(PrintStatus::Printed))
+            .unwrap();
+        cat.set_note(ids["c.stl"], "0.12mm 層高，支撐要開").unwrap();
+        assert_eq!(with_status(StatusFilter::Is(PrintStatus::Todo)), ["a.stl"]);
+        assert_eq!(
+            with_status(StatusFilter::Is(PrintStatus::Printed)),
+            ["b.stl"]
+        );
+        assert_eq!(with_status(StatusFilter::Unmarked), ["c.stl"]);
+
+        let assets = cat.assets(&AssetQuery::default()).unwrap();
+        let b = assets.iter().find(|a| a.rel_path == "b.stl").unwrap();
+        assert_eq!(b.status, Some(PrintStatus::Printed));
+        assert!(b.status_at.unwrap() > 0);
+        let c = assets.iter().find(|a| a.rel_path == "c.stl").unwrap();
+        assert_eq!((c.status, c.note.as_str()), (None, "0.12mm 層高，支撐要開"));
+
+        let found = rel_paths_of(
+            &cat,
+            AssetQuery {
+                search: Some("支撐".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(found, ["c.stl"]);
+
+        let rows = |cat: &Catalog| -> i64 {
+            cat.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM asset_notes", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows(&cat), 3);
+        cat.set_status(&[ids["a.stl"]], None).unwrap();
+        cat.set_note(ids["c.stl"], "  \n").unwrap();
+        assert_eq!(rows(&cat), 1, "cleared rows are dropped");
+        assert_eq!(with_status(StatusFilter::Unmarked), ["a.stl", "c.stl"]);
+    }
+
+    #[test]
+    fn print_status_and_note_follow_moves() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (cat, lib_a, ids) = catalog_with(a.path(), &["x.stl", "y.stl"]);
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.set_status(&[ids["x.stl"]], Some(PrintStatus::Failed))
+            .unwrap();
+        cat.set_note(ids["x.stl"], "warped").unwrap();
+        let y = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "y.stl")
+            .unwrap();
+        cat.set_note(y.id, "elsewhere").unwrap();
+        cat.hash_asset(&y).unwrap();
+
+        // Renamed in place: same row.
+        fs::rename(a.path().join("x.stl"), a.path().join("x2.stl")).unwrap();
+        // Moved to another library: through the stash.
+        fs::rename(a.path().join("y.stl"), b.path().join("y.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        let find = |rel: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|x| x.rel_path == rel)
+                .unwrap()
+        };
+        let x2 = find("x2.stl");
+        assert_eq!(
+            (x2.status, x2.note.as_str()),
+            (Some(PrintStatus::Failed), "warped")
+        );
+        cat.hash_asset(&find("y.stl")).unwrap();
+        assert_eq!(find("y.stl").note, "elsewhere");
+    }
+
+    #[test]
+    fn favorites_follow_renames_moves_and_library_readds() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("x.stl"), "solid x\nendsolid x\n").unwrap();
+        fs::write(a.path().join("y.stl"), "solid y\nendsolid y\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let ids: Vec<i64> = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .iter()
+            .map(|asset| {
+                cat.hash_asset(asset).unwrap();
+                asset.id
+            })
+            .collect();
+        // A star and nothing else is still worth keeping.
+        cat.set_favorite(&ids, true).unwrap();
+
+        // Renamed in place: same row. Moved to another library: through the stash.
+        fs::rename(a.path().join("x.stl"), a.path().join("x2.stl")).unwrap();
+        fs::rename(a.path().join("y.stl"), b.path().join("y.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        let favorite_of = |cat: &Catalog, rel: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|x| x.rel_path == rel)
+                .unwrap()
+        };
+        assert!(favorite_of(&cat, "x2.stl").favorite);
+        let y = favorite_of(&cat, "y.stl");
+        assert!(!y.favorite, "not hashed yet");
+        cat.hash_asset(&y).unwrap();
+        assert!(favorite_of(&cat, "y.stl").favorite);
+
+        cat.remove_library(lib_a.id).unwrap();
+        assert_eq!(cat.favorite_count().unwrap(), 1);
+        let lib_a = cat.add_library(a.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.hash_asset(&favorite_of(&cat, "x2.stl")).unwrap();
+        assert!(favorite_of(&cat, "x2.stl").favorite);
+        assert_eq!(cat.favorite_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn print_info_is_read_once_per_3mf_and_again_after_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, _) = catalog_with(dir.path(), &["a.3mf", "b.3mf", "c.stl"]);
+        let pending = |cat: &Catalog| -> Vec<String> {
+            let mut out: Vec<String> = cat
+                .assets_without_print_info(0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.rel_path)
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(pending(&cat), ["a.3mf", "b.3mf"]);
+        let first = cat.assets_without_print_info(0, 1).unwrap().pop().unwrap();
+        assert_eq!(
+            cat.assets_without_print_info(first.id, 10).unwrap().len(),
+            1
+        );
+        let a = cat
+            .assets_without_print_info(0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.rel_path == "a.3mf")
+            .unwrap();
+        let info = PrintInfo {
+            title: Some("Benchy".into()),
+            materials: vec!["PLA".into(), "PETG".into()],
+            print_time_s: Some(3_000),
+            ..Default::default()
+        };
+        cat.set_print_info(&a, &info).unwrap();
+        let b = cat.assets_without_print_info(0, 10).unwrap().pop().unwrap();
+        assert_eq!(b.rel_path, "b.3mf");
+        cat.set_print_info(&b, &PrintInfo::default()).unwrap();
+        assert!(pending(&cat).is_empty(), "empty results count as read");
+        let stored = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.rel_path, x.print))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(stored["a.3mf"].as_ref(), Some(&info));
+        assert_eq!(stored["b.3mf"], Some(PrintInfo::default()));
+        assert_eq!(stored["c.stl"], None);
+
+        // A changed file is read again, and a result for the old contents
+        // is not stored.
+        fs::write(dir.path().join("a.3mf"), "changed").unwrap();
+        set_mtime(&dir.path().join("a.3mf"), 7_000);
+        cat.scan_library(&lib).unwrap();
+        assert_eq!(pending(&cat), ["a.3mf"]);
+        cat.set_print_info(&a, &info).unwrap();
+        assert_eq!(pending(&cat), ["a.3mf"]);
+
+        // Rows from an older reader version are read again.
+        cat.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE print_info SET version = 0", [])
+            .unwrap();
+        assert_eq!(pending(&cat), ["a.3mf", "b.3mf"]);
+    }
+
+    #[test]
+    fn print_info_filters_by_material_and_time_and_is_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _lib, _) = catalog_with(dir.path(), &["quick.3mf", "long.3mf", "plain.3mf"]);
+        for asset in cat.assets_without_print_info(0, 10).unwrap() {
+            let info = match asset.rel_path.as_str() {
+                "quick.3mf" => PrintInfo {
+                    printer: Some("Bambu Lab A1 mini 0.4 nozzle".into()),
+                    materials: vec!["PLA".into()],
+                    print_time_s: Some(1_800),
+                    ..Default::default()
+                },
+                "long.3mf" => PrintInfo {
+                    designer: Some("Ada".into()),
+                    materials: vec!["PETG".into(), "PLA".into()],
+                    print_time_s: Some(5 * 3_600),
+                    ..Default::default()
+                },
+                _ => PrintInfo::default(),
+            };
+            cat.set_print_info(&asset, &info).unwrap();
+        }
+        let query = |q: AssetQuery| rel_paths_of(&cat, q);
+        assert_eq!(
+            query(AssetQuery {
+                materials: vec!["PETG".into()],
+                ..Default::default()
+            }),
+            ["long.3mf"]
+        );
+        assert_eq!(
+            query(AssetQuery {
+                materials: vec!["PLA".into(), "ABS".into()],
+                ..Default::default()
+            }),
+            ["long.3mf", "quick.3mf"]
+        );
+        assert_eq!(
+            query(AssetQuery {
+                print_time: Some((0, Some(3_600))),
+                ..Default::default()
+            }),
+            ["quick.3mf"]
+        );
+        assert_eq!(
+            query(AssetQuery {
+                print_time: Some((4 * 3_600, None)),
+                ..Default::default()
+            }),
+            ["long.3mf"]
+        );
+        let search = |q: &str| {
+            query(AssetQuery {
+                search: Some(q.into()),
+                ..Default::default()
+            })
+        };
+        assert_eq!(search("a1 mini"), ["quick.3mf"]);
+        assert_eq!(search("ada"), ["long.3mf"]);
+        assert_eq!(search("petg"), ["long.3mf"]);
+        assert_eq!(
+            cat.all_materials().unwrap(),
+            [("PLA".to_string(), 2), ("PETG".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn saved_searches_roundtrip_sorted_by_name() {
+        let cat = Catalog::open_memory().unwrap();
+        let b = cat.add_saved_search(" b ", "{}").unwrap();
+        let a = cat.add_saved_search("A", r#"{"search":"x"}"#).unwrap();
+        let names = |cat: &Catalog| -> Vec<String> {
+            cat.saved_searches()
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        assert_eq!(names(&cat), ["A", "b"]);
+        cat.rename_saved_search(b, "0 first").unwrap();
+        cat.set_saved_search_query(a, "{}").unwrap();
+        assert_eq!(names(&cat), ["0 first", "A"]);
+        assert_eq!(cat.saved_searches().unwrap()[1].query, "{}");
+        cat.remove_saved_search(b).unwrap();
+        assert_eq!(names(&cat), ["A"]);
+    }
+
+    #[test]
+    fn count_matches_assets_without_loading_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, _lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "sub/c.obj"]);
+        cat.set_status(&[ids["a.stl"]], Some(PrintStatus::Todo))
+            .unwrap();
+        for query in [
+            AssetQuery::default(),
+            AssetQuery {
+                formats: vec![AssetFormat::Stl],
+                ..Default::default()
+            },
+            AssetQuery {
+                print_status: Some(StatusFilter::Unmarked),
+                search: Some("c".into()),
+                ..Default::default()
+            },
+            AssetQuery {
+                dir: Some("sub".into()),
+                online_only: true,
+                limit: Some(1),
+                ..Default::default()
+            },
+        ] {
+            let unlimited = AssetQuery {
+                limit: None,
+                ..query.clone()
+            };
+            assert_eq!(
+                cat.count(&query).unwrap() as usize,
+                cat.assets(&unlimited).unwrap().len(),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_moves_pairs_unique_matches_and_confirms_the_rest_by_hash() {
+        let gone = |id, size, mtime, sha: Option<u8>| GoneFile {
+            id,
+            format: "stl".into(),
+            size,
+            mtime,
+            sha: sha.map(|b| vec![b; 32]),
+        };
+        let added = |id, size, mtime| ScannedFile {
+            id,
+            rel: format!("{id}.stl"),
+            format: "stl".into(),
+            size,
+            mtime,
+        };
+        let mut hashed = Vec::new();
+        let moves = plan_moves(
+            &[
+                gone(1, 10, 100, None),
+                gone(2, 20, 200, Some(7)),
+                gone(3, 30, 300, None),
+            ],
+            &[
+                added(11, 10, 100),
+                added(12, 20, 999),
+                added(13, 30, 301),
+                added(14, 20, 998),
+            ],
+            |a| {
+                hashed.push(a.id);
+                Some([if a.id == 12 { 7 } else { 0 }; 32])
+            },
+        );
+        let mut moves = moves;
+        moves.sort();
+        assert_eq!(moves, [(1, 11), (2, 12)]);
+        // Only same-size candidates of a gone file that had a hash.
+        hashed.sort();
+        assert!(hashed.iter().all(|id| [12, 14].contains(id)));
+
+        // A format change is never a move.
+        let mut other = added(21, 10, 100);
+        other.format = "obj".into();
+        assert!(plan_moves(&[gone(1, 10, 100, Some(1))], &[other], |_| Some([1; 32])).is_empty());
     }
 
     #[test]

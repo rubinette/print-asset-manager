@@ -11,7 +11,7 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use pam_core::catalog::{Asset, AssetSort, ThumbState};
+use pam_core::catalog::{Asset, AssetSort, PrintStatus, ThumbState};
 use pam_core::open::open_path;
 use pam_core::paths::thumb_path;
 
@@ -20,6 +20,7 @@ use crate::{SelectAll, SelectDown, SelectLeft, SelectRight, SelectUp};
 
 use super::format::{format_date, group_digits};
 use super::inspector::INSPECTOR_WIDTH;
+use super::print_status::{status_badge, status_icon, status_key};
 use super::selection::Step;
 use super::sidebar::SIDEBAR_WIDTH;
 use super::toolbar::sort_is_ascending;
@@ -241,7 +242,7 @@ fn asset_interactions(
             }
         });
     })
-    .context_menu(move |menu, _, cx| {
+    .context_menu(move |menu, window, cx| {
         let (targets, all_favorite) = workspace
             .upgrade()
             .map(|w| {
@@ -251,7 +252,15 @@ fn asset_interactions(
                 (targets, all_favorite)
             })
             .unwrap_or_else(|| (vec![id], false));
-        asset_menu(menu, targets, all_favorite, path.clone(), workspace.clone())
+        asset_menu(
+            menu,
+            targets,
+            all_favorite,
+            path.clone(),
+            workspace.clone(),
+            window,
+            cx,
+        )
     })
 }
 
@@ -264,6 +273,8 @@ fn asset_menu(
     all_favorite: bool,
     path: std::path::PathBuf,
     workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let (open, reveal, copy) = (path.clone(), path.clone(), path);
     let many = targets.len() > 1;
@@ -273,6 +284,8 @@ fn asset_menu(
         i18n::t(Key::MoveToTrashEllipsis).to_string()
     };
     let regenerate_targets = targets.clone();
+    let status_targets = targets.clone();
+    let status_workspace = workspace.clone();
     let favorite_targets = targets.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(Key::Open))
@@ -294,6 +307,31 @@ fn asset_menu(
             }),
     )
     .separator()
+    .submenu_with_icon(
+        Some(Icon::new(Lucide::Printer)),
+        i18n::t(Key::PrintStatus),
+        window,
+        cx,
+        move |menu, _, _| {
+            let set = |status: Option<PrintStatus>| {
+                let (workspace, ids) = (status_workspace.clone(), status_targets.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = workspace.update(cx, |this, cx| this.set_status(&ids, status, cx));
+                }
+            };
+            PrintStatus::ALL
+                .into_iter()
+                .fold(menu, |menu, status| {
+                    menu.item(
+                        PopupMenuItem::new(i18n::t(status_key(status)))
+                            .icon(status_icon(status))
+                            .on_click(set(Some(status))),
+                    )
+                })
+                .separator()
+                .item(PopupMenuItem::new(i18n::t(Key::ClearStatus)).on_click(set(None)))
+        },
+    )
     .item({
         let workspace = workspace.clone();
         PopupMenuItem::new(i18n::t(if all_favorite {
@@ -387,16 +425,19 @@ fn card(
                         .text_color(theme.muted_foreground)
                         .child(asset.format.label()),
                 )
-                .when(asset.favorite, |el| {
+                .when(asset.favorite || asset.status.is_some(), |el| {
                     el.child(
-                        div()
+                        h_flex()
                             .absolute()
                             .top_1()
                             .right_1()
                             .p_0p5()
-                            .rounded_sm()
+                            .gap_0p5()
+                            .items_center()
+                            .rounded_full()
                             .bg(theme.background.opacity(0.85))
-                            .child(favorite_icon(&theme)),
+                            .when(asset.favorite, |el| el.child(favorite_icon(&theme)))
+                            .children(status_badge(asset, &theme)),
                     )
                 }),
         )
@@ -626,9 +667,10 @@ fn list_row(
                 .min_w_0()
                 .child(
                     h_flex()
-                        .min_w_0()
                         .gap_1()
                         .items_center()
+                        .min_w_0()
+                        .children(status_badge(asset, &theme))
                         .child(
                             div()
                                 .truncate()

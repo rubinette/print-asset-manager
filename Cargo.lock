@@ -4867,6 +4867,7 @@ dependencies = [
  "image",
  "pam-core",
  "pam-preview",
+ "serde_json",
  "sys-locale",
  "tempfile",
 ]
@@ -4880,6 +4881,7 @@ dependencies = [
  "notify 6.1.1",
  "quick-xml 0.37.5",
  "rusqlite",
+ "serde_json",
  "sha2 0.10.9",
  "stl_io",
  "tempfile",

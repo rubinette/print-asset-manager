@@ -119,6 +119,40 @@ pub enum Key {
     RemoveTag,
     RegenerateThumbs,
     TrashDetailMany,
+    PrintStatus,
+    StatusTodo,
+    StatusPrinted,
+    StatusFailed,
+    AnyStatus,
+    Unmarked,
+    ClearStatus,
+    NoteHint,
+    SlicerInfo,
+    Title,
+    Designer,
+    Printer,
+    Materials,
+    PrintTime,
+    Filament,
+    LayerHeight,
+    Slicer,
+    NoMaterialsYet,
+    AnyPrintTime,
+    PrintTimeUnder1h,
+    PrintTime1To4h,
+    PrintTime4To12h,
+    PrintTimeOver12h,
+    SavedSearches,
+    SaveSearch,
+    SaveSearchEllipsis,
+    RenameSavedSearch,
+    Save,
+    RenameEllipsis,
+    UpdateSavedSearch,
+    DeleteEllipsis,
+    Delete,
+    RemoveSavedSearchDetail,
+    NearbyFiles,
     Favorites,
     AddToFavorites,
     RemoveFromFavorites,
@@ -190,6 +224,31 @@ pub fn move_n_to_trash(n: usize) -> String {
 
 pub fn selected_count(n: usize) -> String {
     selected_count_for(current(), n)
+}
+
+/// Estimated print time, e.g. "2 小時 5 分" / "2 h 5 min".
+pub fn duration(secs: u64) -> String {
+    duration_for(current(), secs)
+}
+
+fn duration_for(language: Language, secs: u64) -> String {
+    let minutes = (secs + 30) / 60;
+    let (h, m) = (minutes / 60, minutes % 60);
+    match (language, h, m) {
+        (Language::Chinese, 0, m) => format!("{m} 分"),
+        (Language::Chinese, h, 0) => format!("{h} 小時"),
+        (Language::Chinese, h, m) => format!("{h} 小時 {m} 分"),
+        (Language::English, 0, m) => format!("{m} min"),
+        (Language::English, h, 0) => format!("{h} h"),
+        (Language::English, h, m) => format!("{h} h {m} min"),
+    }
+}
+
+pub fn remove_saved_search_confirm(name: &str) -> String {
+    match current() {
+        Language::Chinese => format!("要刪除已存搜尋「{name}」嗎？"),
+        Language::English => format!("Delete the saved search “{name}”?"),
+    }
 }
 
 pub fn fits_bed(size: &str) -> String {
@@ -458,6 +517,74 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::RegenerateThumbs) => "Regenerate Thumbnails",
         (Language::Chinese, Key::TrashDetailMany) => "原始檔案會移到系統垃圾桶，可從垃圾桶復原。",
         (Language::English, Key::TrashDetailMany) => "The original files will be moved to the system Trash, where you can restore them.",
+        (Language::Chinese, Key::PrintStatus) => "列印狀態",
+        (Language::English, Key::PrintStatus) => "Print Status",
+        (Language::Chinese, Key::StatusTodo) => "待印",
+        (Language::English, Key::StatusTodo) => "To Print",
+        (Language::Chinese, Key::StatusPrinted) => "已印",
+        (Language::English, Key::StatusPrinted) => "Printed",
+        (Language::Chinese, Key::StatusFailed) => "失敗",
+        (Language::English, Key::StatusFailed) => "Failed",
+        (Language::Chinese, Key::AnyStatus) => "任何狀態",
+        (Language::English, Key::AnyStatus) => "Any Status",
+        (Language::Chinese, Key::Unmarked) => "未標記",
+        (Language::English, Key::Unmarked) => "Not Marked",
+        (Language::Chinese, Key::ClearStatus) => "清除列印狀態",
+        (Language::English, Key::ClearStatus) => "Clear Print Status",
+        (Language::Chinese, Key::NoteHint) => "備註：參數、心得…",
+        (Language::English, Key::NoteHint) => "Notes: settings, how it went…",
+        (Language::Chinese, Key::SlicerInfo) => "切片資訊",
+        (Language::English, Key::SlicerInfo) => "Slicer Info",
+        (Language::Chinese, Key::Title) => "標題",
+        (Language::English, Key::Title) => "Title",
+        (Language::Chinese, Key::Designer) => "設計者",
+        (Language::English, Key::Designer) => "Designer",
+        (Language::Chinese, Key::Printer) => "印表機",
+        (Language::English, Key::Printer) => "Printer",
+        (Language::Chinese, Key::Materials) => "材料",
+        (Language::English, Key::Materials) => "Material",
+        (Language::Chinese, Key::PrintTime) => "列印時間",
+        (Language::English, Key::PrintTime) => "Print Time",
+        (Language::Chinese, Key::Filament) => "耗材",
+        (Language::English, Key::Filament) => "Filament",
+        (Language::Chinese, Key::LayerHeight) => "層高",
+        (Language::English, Key::LayerHeight) => "Layer Height",
+        (Language::Chinese, Key::Slicer) => "切片軟體",
+        (Language::English, Key::Slicer) => "Slicer",
+        (Language::Chinese, Key::NoMaterialsYet) => "還沒有 3MF 材料資訊",
+        (Language::English, Key::NoMaterialsYet) => "No material info from 3MF files yet",
+        (Language::Chinese, Key::AnyPrintTime) => "任何時間",
+        (Language::English, Key::AnyPrintTime) => "Any Time",
+        (Language::Chinese, Key::PrintTimeUnder1h) => "1 小時內",
+        (Language::English, Key::PrintTimeUnder1h) => "Under 1 hour",
+        (Language::Chinese, Key::PrintTime1To4h) => "1–4 小時",
+        (Language::English, Key::PrintTime1To4h) => "1–4 hours",
+        (Language::Chinese, Key::PrintTime4To12h) => "4–12 小時",
+        (Language::English, Key::PrintTime4To12h) => "4–12 hours",
+        (Language::Chinese, Key::PrintTimeOver12h) => "12 小時以上",
+        (Language::English, Key::PrintTimeOver12h) => "Over 12 hours",
+        (Language::Chinese, Key::SavedSearches) => "已存搜尋",
+        (Language::English, Key::SavedSearches) => "Saved Searches",
+        (Language::Chinese, Key::SaveSearch) => "儲存搜尋",
+        (Language::English, Key::SaveSearch) => "Save Search",
+        (Language::Chinese, Key::SaveSearchEllipsis) => "儲存目前的搜尋…",
+        (Language::English, Key::SaveSearchEllipsis) => "Save Current Search…",
+        (Language::Chinese, Key::RenameSavedSearch) => "重新命名搜尋",
+        (Language::English, Key::RenameSavedSearch) => "Rename Search",
+        (Language::Chinese, Key::Save) => "儲存",
+        (Language::English, Key::Save) => "Save",
+        (Language::Chinese, Key::RenameEllipsis) => "重新命名…",
+        (Language::English, Key::RenameEllipsis) => "Rename…",
+        (Language::Chinese, Key::UpdateSavedSearch) => "改成目前的條件",
+        (Language::English, Key::UpdateSavedSearch) => "Update to Current Search",
+        (Language::Chinese, Key::DeleteEllipsis) => "刪除…",
+        (Language::English, Key::DeleteEllipsis) => "Delete…",
+        (Language::Chinese, Key::Delete) => "刪除",
+        (Language::English, Key::Delete) => "Delete",
+        (Language::Chinese, Key::RemoveSavedSearchDetail) => "只會刪除這個已存搜尋，不會動到任何檔案。",
+        (Language::English, Key::RemoveSavedSearchDetail) => "Only the saved search is deleted; no files are touched.",
+        (Language::Chinese, Key::NearbyFiles) => "同資料夾的圖片與說明",
+        (Language::English, Key::NearbyFiles) => "Images and docs nearby",
         (Language::Chinese, Key::Favorites) => "我的最愛",
         (Language::English, Key::Favorites) => "Favorites",
         (Language::Chinese, Key::AddToFavorites) => "加入我的最愛",
@@ -632,6 +759,40 @@ mod tests {
             Key::RemoveTag,
             Key::RegenerateThumbs,
             Key::TrashDetailMany,
+            Key::PrintStatus,
+            Key::StatusTodo,
+            Key::StatusPrinted,
+            Key::StatusFailed,
+            Key::AnyStatus,
+            Key::Unmarked,
+            Key::ClearStatus,
+            Key::NoteHint,
+            Key::SlicerInfo,
+            Key::Title,
+            Key::Designer,
+            Key::Printer,
+            Key::Materials,
+            Key::PrintTime,
+            Key::Filament,
+            Key::LayerHeight,
+            Key::Slicer,
+            Key::NoMaterialsYet,
+            Key::AnyPrintTime,
+            Key::PrintTimeUnder1h,
+            Key::PrintTime1To4h,
+            Key::PrintTime4To12h,
+            Key::PrintTimeOver12h,
+            Key::SavedSearches,
+            Key::SaveSearch,
+            Key::SaveSearchEllipsis,
+            Key::RenameSavedSearch,
+            Key::Save,
+            Key::RenameEllipsis,
+            Key::UpdateSavedSearch,
+            Key::DeleteEllipsis,
+            Key::Delete,
+            Key::RemoveSavedSearchDetail,
+            Key::NearbyFiles,
             Key::Favorites,
             Key::AddToFavorites,
             Key::RemoveFromFavorites,
@@ -646,6 +807,16 @@ mod tests {
                 "missing en for {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn durations_round_to_minutes() {
+        assert_eq!(duration_for(Language::Chinese, 7_500), "2 小時 5 分");
+        assert_eq!(duration_for(Language::Chinese, 3_599), "1 小時");
+        assert_eq!(duration_for(Language::Chinese, 29), "0 分");
+        assert_eq!(duration_for(Language::English, 2_700), "45 min");
+        assert_eq!(duration_for(Language::English, 7_200), "2 h");
+        assert_eq!(duration_for(Language::English, 5_425), "1 h 30 min");
     }
 
     #[test]

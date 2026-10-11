@@ -3,8 +3,11 @@ mod filters;
 mod format;
 mod inspector;
 mod library;
+mod nearby;
 mod preview;
+mod print_status;
 mod removal;
+mod saved;
 mod selection;
 mod sidebar;
 mod toolbar;
@@ -13,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Root, TitleBar};
 use gpui_kit::{prelude::FluentBuilder as _, Focusable as _, *};
@@ -32,9 +35,11 @@ use crate::{
 use asset_view::{
     asset_pane, card_slider_state, grid_layout, ViewMode, CARD_DEFAULT, CARD_MAX, CARD_MIN,
 };
-use filters::{filter_bar, parse_bed, Filters, SizeBucket, DEFAULT_BED};
+use filters::{filter_bar, parse_bed, Filters, PrintTimeBucket, SizeBucket, DEFAULT_BED};
 use inspector::inspector;
+use nearby::Nearby;
 use preview::PreviewMesh;
+use saved::{NameTarget, SavedEntry};
 use sidebar::{sidebar, FolderNode, Location};
 use toolbar::toolbar;
 
@@ -73,6 +78,8 @@ pub struct Workspace {
     catalog: Arc<Catalog>,
     libraries: Vec<Library>,
     tags: Vec<(String, i64)>,
+    /// Filament types in 3MF slicer settings, with file counts.
+    materials: Vec<(String, i64)>,
     assets: Vec<Asset>,
     /// Primary selection: previewed, shown in the inspector, moved by arrows.
     selected: Option<i64>,
@@ -90,6 +97,10 @@ pub struct Workspace {
     /// Expanded tree nodes as (library id, folder path); "" is the library itself.
     expanded: HashSet<(i64, String)>,
     duplicate_count: u32,
+    saved: Vec<SavedEntry>,
+    /// Name input of the save/rename dialog, and what it is naming.
+    saved_name_input: Entity<InputState>,
+    naming: Option<NameTarget>,
     favorite_count: u32,
     /// Assets sharing the primary selection's content hash, itself included.
     selected_copies: u32,
@@ -97,6 +108,10 @@ pub struct Workspace {
     tag_input: Entity<InputState>,
     /// Inspector input that adds tags to every selected asset.
     batch_tag_input: Entity<InputState>,
+    note_input: Entity<TextareaState>,
+    /// Asset whose note `note_input` holds, and the note as last saved.
+    note_asset: Option<(i64, String)>,
+    note_generation: u64,
     search_text: String,
     search_generation: u64,
     sort: AssetSort,
@@ -108,6 +123,8 @@ pub struct Workspace {
     preview_busy: bool,
     preview_dirty: bool,
     last_preview_pos: Option<Point<Pixels>>,
+    /// Images and documents next to the selected asset.
+    nearby: Nearby,
     watch: Option<WatchHandle>,
     scan_done: u32,
     scan_total: u32,
@@ -143,6 +160,8 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::TagsHint)));
         let batch_tag_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t(Key::AddTagsHint)));
+        let note_input = cx.new(|cx| print_status::new_note_input(window, cx));
+        let saved_name_input = cx.new(|cx| InputState::new(window, cx));
 
         let card_size = read_pref("card_size")
             .and_then(|raw| raw.trim().parse::<f32>().ok())
@@ -190,6 +209,22 @@ impl Workspace {
                 }
             },
         ));
+        subs.push(cx.subscribe_in(
+            &note_input,
+            window,
+            |this, _, event, _window, cx| match event {
+                InputEvent::Change => this.schedule_note_save(cx),
+                InputEvent::Blur => this.save_note(cx),
+                _ => {}
+            },
+        ));
+        subs.push(
+            cx.subscribe_in(&saved_name_input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_name(window, cx);
+                }
+            }),
+        );
         subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             apply_system_theme(Some(window), cx);
             if this.selected.is_some() {
@@ -202,6 +237,7 @@ impl Workspace {
             catalog,
             libraries: Vec::new(),
             tags: Vec::new(),
+            materials: Vec::new(),
             assets: Vec::new(),
             selected: None,
             selection: Vec::new(),
@@ -215,11 +251,17 @@ impl Workspace {
             folder_trees: HashMap::new(),
             expanded: HashSet::new(),
             duplicate_count: 0,
+            saved: Vec::new(),
+            saved_name_input,
+            naming: None,
             favorite_count: 0,
             selected_copies: 0,
             search,
             tag_input,
             batch_tag_input,
+            note_input,
+            note_asset: None,
+            note_generation: 0,
             search_text: String::new(),
             search_generation: 0,
             sort: read_pref("sort")
@@ -233,6 +275,7 @@ impl Workspace {
             preview_busy: false,
             preview_dirty: false,
             last_preview_pos: None,
+            nearby: Nearby::default(),
             watch: WatchHandle::start().ok(),
             scan_done: 0,
             scan_total: 0,
@@ -270,6 +313,9 @@ impl Workspace {
         self.batch_tag_input.update(cx, |input, cx| {
             input.set_placeholder(i18n::t(Key::AddTagsHint), window, cx);
         });
+        self.note_input.update(cx, |input, cx| {
+            input.set_placeholder(i18n::t(Key::NoteHint), window, cx);
+        });
         cx.notify();
     }
 
@@ -283,6 +329,9 @@ impl Workspace {
                 .tags
                 .retain(|t| tags.iter().any(|(name, _)| name == t));
             self.tags = tags;
+        }
+        if let Ok(materials) = self.catalog.all_materials() {
+            self.materials = materials;
         }
         if let Ok(n) = self.catalog.duplicate_count() {
             self.duplicate_count = n;
@@ -312,15 +361,20 @@ impl Workspace {
         if !cache_fresh {
             self.preview_mesh = None;
         }
+        self.reload_saved();
         cx.notify();
     }
 
     fn query(&self) -> AssetQuery {
-        let (library_id, dir) = match &self.location {
+        self.query_for(&self.location, &self.filters, &self.search_text)
+    }
+
+    /// The catalog query for a sidebar location, filters and search text.
+    fn query_for(&self, location: &Location, f: &Filters, search: &str) -> AssetQuery {
+        let (library_id, dir) = match location {
             Location::Library { id, dir } => (Some(*id), dir.clone()),
             Location::All | Location::Duplicates | Location::Favorites => (None, None),
         };
-        let f = &self.filters;
         AssetQuery {
             library_id,
             dir,
@@ -333,13 +387,16 @@ impl Workspace {
                 .modified
                 .map(|m| now_ns() - m.days() * 86_400 * 1_000_000_000),
             untagged: f.untagged,
+            print_status: f.status,
+            materials: f.materials.clone(),
+            print_time: f.print_time.map(PrintTimeBucket::range),
             thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
-            duplicates_only: self.location == Location::Duplicates,
-            favorites_only: self.location == Location::Favorites,
-            search: if self.search_text.trim().is_empty() {
+            duplicates_only: *location == Location::Duplicates,
+            favorites_only: *location == Location::Favorites,
+            search: if search.trim().is_empty() {
                 None
             } else {
-                Some(self.search_text.clone())
+                Some(search.to_string())
             },
             sort: self.sort,
             ..Default::default()
@@ -395,6 +452,14 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         (self.grid_cols, self.grid_card_width) =
             grid_layout(window.viewport_size().width.as_f32(), self.card_size);
+        if self.note_asset.as_ref().map(|(id, _)| *id) != self.selected {
+            cx.defer_in(window, |this, window, cx| {
+                this.sync_inspector_inputs(window, cx)
+            });
+        }
+        if self.nearby.asset_id != self.selected {
+            cx.defer_in(window, |this, _, cx| this.load_nearby(cx));
+        }
         v_flex()
             .size_full()
             .bg(theme.background)
