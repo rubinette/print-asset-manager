@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS asset_tags (
   PRIMARY KEY (asset_id, tag_id)
 );
 
+-- Its own table rather than an assets column: there are no migrations, and
+-- CREATE TABLE IF NOT EXISTS reaches catalogs made before favorites existed.
+CREATE TABLE IF NOT EXISTS favorites (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE
+);
+
 -- Print status and note per asset. Its own table rather than assets columns:
 -- there are no migrations, and CREATE TABLE IF NOT EXISTS reaches catalogs
 -- made before it existed. A row is dropped once both are cleared.
@@ -202,6 +208,7 @@ pub struct Asset {
     pub note: String,
     /// Slicer metadata of a 3MF, once read; `None` for other formats.
     pub print: Option<PrintInfo>,
+    pub favorite: bool,
 }
 
 impl Asset {
@@ -374,6 +381,7 @@ pub struct AssetQuery {
     pub modified_since_ns: Option<i64>,
     pub untagged: bool,
     pub print_status: Option<StatusFilter>,
+    pub favorites_only: bool,
     /// Only assets whose content hash is shared with another asset.
     pub duplicates_only: bool,
     pub search: Option<String>,
@@ -945,6 +953,31 @@ impl Catalog {
         Ok(())
     }
 
+    /// Star or unstar every asset in `ids`.
+    pub fn set_favorite(&self, ids: &[i64], favorite: bool) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for &id in ids {
+            if favorite {
+                tx.execute(
+                    "INSERT OR IGNORE INTO favorites (asset_id)
+                     SELECT id FROM assets WHERE id = ?1",
+                    params![id],
+                )?;
+            } else {
+                tx.execute("DELETE FROM favorites WHERE asset_id = ?1", params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn favorite_count(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))?;
+        Ok(n as u32)
+    }
+
     /// Set (or with `None` clear) the print status of every asset in `ids`.
     pub fn set_status(&self, ids: &[i64], status: Option<PrintStatus>) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
@@ -1095,6 +1128,9 @@ fn push_query_filters(
     if query.untagged {
         sql.push_str(" AND NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)");
     }
+    if query.favorites_only {
+        sql.push_str(" AND a.id IN (SELECT asset_id FROM favorites)");
+    }
     match query.print_status {
         Some(StatusFilter::Is(status)) => {
             sql.push_str(" AND a.id IN (SELECT asset_id FROM asset_notes WHERE status = ?)");
@@ -1204,7 +1240,8 @@ const SELECT_ASSETS: &str = "SELECT a.id, a.library_id, l.root_path, a.rel_path,
         a.bbox_max_x, a.bbox_max_y, a.bbox_max_z,
         a.thumb_state, a.error, n.status, n.status_at, COALESCE(n.note, ''),
         p.asset_id, p.title, p.designer, p.application, p.printer, p.materials,
-        p.print_time_s, p.filament_g, p.layer_height
+        p.print_time_s, p.filament_g, p.layer_height,
+        EXISTS (SELECT 1 FROM favorites f WHERE f.asset_id = a.id)
  FROM assets a
  JOIN libraries l ON l.id = a.library_id
  LEFT JOIN asset_notes n ON n.asset_id = a.id
@@ -1263,6 +1300,7 @@ fn asset_from_row(r: &rusqlite::Row) -> rusqlite::Result<Asset> {
                 layer_height_mm: r.get(28)?,
             }),
         },
+        favorite: r.get(29)?,
     })
 }
 
@@ -1482,6 +1520,11 @@ fn relink_moved(conn: &Connection, old_id: i64, new_id: i64) -> Result<bool> {
          SELECT ?1, tag_id FROM asset_tags WHERE asset_id = ?2",
         params![old_id, new_id],
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO favorites (asset_id)
+         SELECT ?1 FROM favorites WHERE asset_id = ?2",
+        params![old_id, new_id],
+    )?;
     let _ = conn.execute("DELETE FROM assets_fts WHERE rowid = ?1", params![new_id]);
     conn.execute("DELETE FROM assets WHERE id = ?1", params![new_id])?;
     conn.execute(
@@ -1503,12 +1546,14 @@ fn stash_user_data(conn: &Connection, condition: &str, arg: i64) -> Result<Vec<V
              SELECT a.content_sha256, json_object(
                  'tags', json((SELECT json_group_array(t.name) FROM asset_tags at
                                JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = a.id)),
-                 'status', n.status, 'status_at', n.status_at, 'note', n.note
+                 'status', n.status, 'status_at', n.status_at, 'note', n.note,
+                 'favorite', json(CASE WHEN f.asset_id IS NULL THEN 'false' ELSE 'true' END)
                ), ?2
              FROM assets a
              LEFT JOIN asset_notes n ON n.asset_id = a.id
+             LEFT JOIN favorites f ON f.asset_id = a.id
              WHERE ({condition}) AND a.content_sha256 IS NOT NULL
-               AND (n.asset_id IS NOT NULL
+               AND (n.asset_id IS NOT NULL OR f.asset_id IS NOT NULL
                     OR EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id))
              RETURNING content_sha256"
     ))?;
@@ -1530,6 +1575,7 @@ fn reattach_to_indexed_copy(conn: &Connection, shas: &[Vec<u8>]) -> Result<()> {
                  WHERE a.content_sha256 = ?1
                    AND NOT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = a.id)
                    AND NOT EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = a.id)
+                   AND NOT EXISTS (SELECT 1 FROM favorites WHERE asset_id = a.id)
                  ORDER BY a.id DESC LIMIT 1",
                 params![sha],
                 |r| r.get(0),
@@ -1558,7 +1604,8 @@ fn reattach_user_data(conn: &Connection, id: i64, sha: &[u8]) -> Result<()> {
     };
     let has_own: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = ?1)
-             OR EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = ?1)",
+             OR EXISTS (SELECT 1 FROM asset_notes WHERE asset_id = ?1)
+             OR EXISTS (SELECT 1 FROM favorites WHERE asset_id = ?1)",
         params![id],
         |r| r.get(0),
     )?;
@@ -1578,6 +1625,12 @@ fn reattach_user_data(conn: &Connection, id: i64, sha: &[u8]) -> Result<()> {
             params![id, data],
         )?;
         drop_empty_notes(conn, id)?;
+        // Stashes from before favorites existed have no `favorite` key.
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites (asset_id)
+             SELECT ?1 WHERE json_extract(?2, '$.favorite') = 1",
+            params![id, data],
+        )?;
     }
     conn.execute(
         "DELETE FROM detached_meta WHERE content_sha256 = ?1",
@@ -2854,6 +2907,55 @@ mod tests {
     }
 
     #[test]
+    fn favorites_follow_renames_moves_and_library_readds() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("x.stl"), "solid x\nendsolid x\n").unwrap();
+        fs::write(a.path().join("y.stl"), "solid y\nendsolid y\n").unwrap();
+        let cat = Catalog::open_memory().unwrap();
+        let lib_a = cat.add_library(a.path()).unwrap();
+        let lib_b = cat.add_library(b.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        let ids: Vec<i64> = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .iter()
+            .map(|asset| {
+                cat.hash_asset(asset).unwrap();
+                asset.id
+            })
+            .collect();
+        // A star and nothing else is still worth keeping.
+        cat.set_favorite(&ids, true).unwrap();
+
+        // Renamed in place: same row. Moved to another library: through the stash.
+        fs::rename(a.path().join("x.stl"), a.path().join("x2.stl")).unwrap();
+        fs::rename(a.path().join("y.stl"), b.path().join("y.stl")).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.scan_library(&lib_b).unwrap();
+        let favorite_of = |cat: &Catalog, rel: &str| {
+            cat.assets(&AssetQuery::default())
+                .unwrap()
+                .into_iter()
+                .find(|x| x.rel_path == rel)
+                .unwrap()
+        };
+        assert!(favorite_of(&cat, "x2.stl").favorite);
+        let y = favorite_of(&cat, "y.stl");
+        assert!(!y.favorite, "not hashed yet");
+        cat.hash_asset(&y).unwrap();
+        assert!(favorite_of(&cat, "y.stl").favorite);
+
+        cat.remove_library(lib_a.id).unwrap();
+        assert_eq!(cat.favorite_count().unwrap(), 1);
+        let lib_a = cat.add_library(a.path()).unwrap();
+        cat.scan_library(&lib_a).unwrap();
+        cat.hash_asset(&favorite_of(&cat, "x2.stl")).unwrap();
+        assert!(favorite_of(&cat, "x2.stl").favorite);
+        assert_eq!(cat.favorite_count().unwrap(), 2);
+    }
+
+    #[test]
     fn print_info_is_read_once_per_3mf_and_again_after_changes() {
         let dir = tempfile::tempdir().unwrap();
         let (cat, lib, _) = catalog_with(dir.path(), &["a.3mf", "b.3mf", "c.stl"]);
@@ -3086,6 +3188,57 @@ mod tests {
         let mut other = added(21, 10, 100);
         other.format = "obj".into();
         assert!(plan_moves(&[gone(1, 10, 100, Some(1))], &[other], |_| Some([1; 32])).is_empty());
+    }
+
+    #[test]
+    fn favorites_filter_survive_edits_and_follow_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cat, lib, ids) = catalog_with(dir.path(), &["a.stl", "b.stl", "c.stl"]);
+        let favorites = |cat: &Catalog| {
+            rel_paths_of(
+                cat,
+                AssetQuery {
+                    favorites_only: true,
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(favorites(&cat).is_empty());
+
+        cat.set_favorite(&[ids["a.stl"], ids["b.stl"]], true)
+            .unwrap();
+        // Starring twice, or an id that isn't an asset, is a no-op.
+        cat.set_favorite(&[ids["a.stl"], 9_999], true).unwrap();
+        assert_eq!(favorites(&cat), ["a.stl", "b.stl"]);
+        assert_eq!(cat.favorite_count().unwrap(), 2);
+        let flags: HashMap<String, bool> = cat
+            .assets(&AssetQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.rel_path, a.favorite))
+            .collect();
+        assert!(flags["a.stl"] && flags["b.stl"] && !flags["c.stl"]);
+
+        cat.set_favorite(&[ids["b.stl"]], false).unwrap();
+        assert_eq!(favorites(&cat), ["a.stl"]);
+
+        // Editing the file keeps the star; deleting it drops the star.
+        fs::write(
+            dir.path().join("a.stl"),
+            "solid changed\nendsolid changed\n",
+        )
+        .unwrap();
+        set_mtime(&dir.path().join("a.stl"), 1_000_000);
+        cat.scan_library(&lib).unwrap();
+        assert_eq!(favorites(&cat), ["a.stl"]);
+        fs::remove_file(dir.path().join("a.stl")).unwrap();
+        cat.scan_library(&lib).unwrap();
+        assert!(favorites(&cat).is_empty());
+        assert_eq!(cat.favorite_count().unwrap(), 0);
+
+        cat.set_favorite(&[ids["c.stl"]], true).unwrap();
+        cat.remove_library(lib.id).unwrap();
+        assert_eq!(cat.favorite_count().unwrap(), 0);
     }
 
     #[test]

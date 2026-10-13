@@ -31,6 +31,7 @@ impl SavedQuery {
         let location = match &self.location {
             Location::All => json!({"kind": "all"}),
             Location::Duplicates => json!({"kind": "duplicates"}),
+            Location::Favorites => json!({"kind": "favorites"}),
             Location::Library { id, dir } => json!({"kind": "library", "id": id, "dir": dir}),
         };
         json!({
@@ -49,6 +50,7 @@ impl SavedQuery {
         Self {
             location: match location["kind"].as_str() {
                 Some("duplicates") => Location::Duplicates,
+                Some("favorites") => Location::Favorites,
                 Some("library") => match location["id"].as_i64() {
                     Some(id) => Location::Library {
                         id,
@@ -273,6 +275,7 @@ impl Workspace {
             parts.push(match &query.location {
                 Location::All => i18n::t(Key::AllAssets).to_string(),
                 Location::Duplicates => i18n::t(Key::Duplicates).to_string(),
+                Location::Favorites => i18n::t(Key::Favorites).to_string(),
                 Location::Library { id, dir } => match dir {
                     Some(dir) => dir.rsplit('/').next().unwrap_or(dir).to_string(),
                     None => self
@@ -372,6 +375,10 @@ mod tests {
             },
             SavedQuery {
                 location: Location::Library { id: 1, dir: None },
+                ..Default::default()
+            },
+            SavedQuery {
+                location: Location::Favorites,
                 ..Default::default()
             },
         ];

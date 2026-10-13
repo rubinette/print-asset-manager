@@ -1,5 +1,5 @@
-//! Sidebar: all assets, duplicates, library folder trees, saved searches,
-//! and tags.
+//! Sidebar: all assets, favorites, duplicates, library folder trees, saved
+//! searches, and tags.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +27,7 @@ pub(super) enum Location {
         dir: Option<String>,
     },
     Duplicates,
+    Favorites,
 }
 
 /// A folder inside a library; the root node has an empty `path`.
@@ -202,6 +203,22 @@ pub(super) fn sidebar(this: &Workspace, cx: &mut Context<Workspace>) -> impl Int
             }),
             &theme,
         ))
+        // Stays while open so unstarring the last file doesn't yank the view away.
+        .when(
+            this.favorite_count > 0 || this.location == Location::Favorites,
+            |el| {
+                el.child(nav_item(
+                    "nav-favorites",
+                    Lucide::Star.into(),
+                    i18n::t(Key::Favorites).to_string(),
+                    Some(this.favorite_count.to_string()),
+                    this.location == Location::Favorites,
+                    false,
+                    cx.listener(|this, _, _, cx| this.set_location(Location::Favorites, cx)),
+                    &theme,
+                ))
+            },
+        )
         .when(this.duplicate_count > 0, |el| {
             el.child(nav_item(
                 "nav-duplicates",

@@ -15,6 +15,7 @@ use pam_preview::Camera;
 
 use crate::i18n::{self, Key};
 
+use super::asset_view::favorite_icon;
 use super::format::{format_date, group_digits};
 use super::nearby::nearby_section;
 use super::print_status::{status_buttons, status_date};
@@ -282,6 +283,24 @@ fn asset_details(this: &Workspace, asset: &Asset, cx: &mut Context<Workspace>) -
                         .label(i18n::t(Key::Open))
                         .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
                 )
+                .child({
+                    let (id, favorite) = (asset.id, asset.favorite);
+                    Button::new("favorite")
+                        .outline()
+                        .icon(if favorite {
+                            favorite_icon(&theme)
+                        } else {
+                            Icon::new(Lucide::Star)
+                        })
+                        .tooltip(i18n::t(if favorite {
+                            Key::RemoveFromFavorites
+                        } else {
+                            Key::AddToFavorites
+                        }))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_favorite(&[id], window, cx)
+                        }))
+                })
                 .child(
                     Button::new("reveal")
                         .outline()
@@ -376,6 +395,25 @@ fn batch_details(this: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElem
             this.selection.clone(),
             cx,
         ))
+        .child({
+            let all_favorite = this.all_favorite(&this.selection);
+            Button::new("favorite-selection")
+                .outline()
+                .icon(Icon::new(if all_favorite {
+                    Lucide::StarOff
+                } else {
+                    Lucide::Star
+                }))
+                .label(i18n::t(if all_favorite {
+                    Key::RemoveFromFavorites
+                } else {
+                    Key::AddToFavorites
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let ids = this.selection.clone();
+                    this.toggle_favorite(&ids, window, cx)
+                }))
+        })
         .child(
             Button::new("trash-selection")
                 .outline()

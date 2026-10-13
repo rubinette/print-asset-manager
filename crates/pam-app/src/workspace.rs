@@ -28,8 +28,8 @@ use pam_preview::Camera;
 use crate::i18n::{self, Key, LanguagePref};
 use crate::jobs;
 use crate::{
-    apply_language, apply_system_theme, AddFolder, FocusSearch, OpenSelected, TrashSelected,
-    UseChinese, UseEnglish, UseSystemLanguage,
+    apply_language, apply_system_theme, AddFolder, FocusSearch, OpenSelected, ToggleFavorite,
+    TrashSelected, UseChinese, UseEnglish, UseSystemLanguage,
 };
 
 use asset_view::{
@@ -101,6 +101,7 @@ pub struct Workspace {
     /// Name input of the save/rename dialog, and what it is naming.
     saved_name_input: Entity<InputState>,
     naming: Option<NameTarget>,
+    favorite_count: u32,
     /// Assets sharing the primary selection's content hash, itself included.
     selected_copies: u32,
     search: Entity<InputState>,
@@ -255,6 +256,7 @@ impl Workspace {
             saved: Vec::new(),
             saved_name_input,
             naming: None,
+            favorite_count: 0,
             selected_copies: 0,
             search,
             tag_input,
@@ -337,6 +339,9 @@ impl Workspace {
         if let Ok(n) = self.catalog.duplicate_count() {
             self.duplicate_count = n;
         }
+        if let Ok(n) = self.catalog.favorite_count() {
+            self.favorite_count = n;
+        }
         match self.catalog.assets(&self.query()) {
             Ok(assets) => self.assets = assets,
             Err(err) => eprintln!("catalog query failed: {err}"),
@@ -371,7 +376,7 @@ impl Workspace {
     fn query_for(&self, location: &Location, f: &Filters, search: &str) -> AssetQuery {
         let (library_id, dir) = match location {
             Location::Library { id, dir } => (Some(*id), dir.clone()),
-            Location::All | Location::Duplicates => (None, None),
+            Location::All | Location::Duplicates | Location::Favorites => (None, None),
         };
         AssetQuery {
             library_id,
@@ -390,6 +395,7 @@ impl Workspace {
             print_time: f.print_time.map(PrintTimeBucket::range),
             thumb_state: f.thumb_failed.then_some(ThumbState::Failed),
             duplicates_only: *location == Location::Duplicates,
+            favorites_only: *location == Location::Favorites,
             search: if search.trim().is_empty() {
                 None
             } else {
@@ -405,7 +411,7 @@ impl Workspace {
     fn is_filtered(&self) -> bool {
         self.filters != Filters::default()
             || !self.search_text.trim().is_empty()
-            || self.location == Location::Duplicates
+            || matches!(self.location, Location::Duplicates | Location::Favorites)
     }
 
     fn refresh_copies(&mut self) {
@@ -466,6 +472,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &TrashSelected, window, cx| {
                 let ids = this.selection.clone();
                 this.confirm_trash(&ids, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFavorite, window, cx| {
+                let ids = this.selection.clone();
+                this.toggle_favorite(&ids, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 window.focus(&this.search.read(cx).focus_handle(cx), cx);

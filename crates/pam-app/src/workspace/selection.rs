@@ -1,5 +1,7 @@
 //! Which assets are selected, and how clicks and arrow keys change that.
 
+use std::collections::HashSet;
+
 use gpui_kit::*;
 use pam_core::catalog::Asset;
 use pam_preview::Camera;
@@ -102,6 +104,40 @@ impl Workspace {
         } else {
             vec![id]
         }
+    }
+
+    /// Whether every asset in `ids` is starred, so toggling them unstars.
+    pub(super) fn all_favorite(&self, ids: &[i64]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        let starred: HashSet<i64> = self
+            .assets
+            .iter()
+            .filter(|a| a.favorite)
+            .map(|a| a.id)
+            .collect();
+        ids.iter().all(|id| starred.contains(id))
+    }
+
+    /// Unstar `ids` if they are all starred, otherwise star them all.
+    pub(super) fn toggle_favorite(
+        &mut self,
+        ids: &[i64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+        let favorite = !self.all_favorite(ids);
+        let index = self.selected_index().unwrap_or(0);
+        if let Err(err) = self.catalog.set_favorite(ids, favorite) {
+            eprintln!("set favorite failed: {err}");
+        }
+        // Unstarring in the favorites view drops the rows, possibly the
+        // selected one, so refresh the preview and tag input like a removal.
+        self.reload_after_removal(index, window, cx);
     }
 
     /// Select only `id`.
@@ -231,6 +267,7 @@ mod tests {
             status_at: None,
             note: String::new(),
             print: None,
+            favorite: false,
         }
     }
 

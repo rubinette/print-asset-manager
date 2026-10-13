@@ -243,19 +243,34 @@ fn asset_interactions(
         });
     })
     .context_menu(move |menu, window, cx| {
-        let targets = workspace
+        let (targets, all_favorite) = workspace
             .upgrade()
-            .map(|w| w.read(cx).targets_for(id))
-            .unwrap_or_else(|| vec![id]);
-        asset_menu(menu, targets, path.clone(), workspace.clone(), window, cx)
+            .map(|w| {
+                let this = w.read(cx);
+                let targets = this.targets_for(id);
+                let all_favorite = this.all_favorite(&targets);
+                (targets, all_favorite)
+            })
+            .unwrap_or_else(|| (vec![id], false));
+        asset_menu(
+            menu,
+            targets,
+            all_favorite,
+            path.clone(),
+            workspace.clone(),
+            window,
+            cx,
+        )
     })
 }
 
-/// Open / reveal / copy act on the clicked asset; thumbnail and trash items
-/// act on every target (the selection, when the click was inside it).
+/// Open / reveal / copy act on the clicked asset; favorite, thumbnail and
+/// trash items act on every target (the selection, when the click was inside
+/// it).
 fn asset_menu(
     menu: PopupMenu,
     targets: Vec<i64>,
+    all_favorite: bool,
     path: std::path::PathBuf,
     workspace: WeakEntity<Workspace>,
     window: &mut Window,
@@ -271,6 +286,7 @@ fn asset_menu(
     let regenerate_targets = targets.clone();
     let status_targets = targets.clone();
     let status_workspace = workspace.clone();
+    let favorite_targets = targets.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(Key::Open))
             .icon(IconName::ExternalLink)
@@ -318,6 +334,24 @@ fn asset_menu(
     )
     .item({
         let workspace = workspace.clone();
+        PopupMenuItem::new(i18n::t(if all_favorite {
+            Key::RemoveFromFavorites
+        } else {
+            Key::AddToFavorites
+        }))
+        .icon(Icon::new(if all_favorite {
+            Lucide::StarOff
+        } else {
+            Lucide::Star
+        }))
+        .on_click(move |_, window, cx| {
+            let _ = workspace.update(cx, |this, cx| {
+                this.toggle_favorite(&favorite_targets, window, cx)
+            });
+        })
+    })
+    .item({
+        let workspace = workspace.clone();
         PopupMenuItem::new(i18n::t(if many {
             Key::RegenerateThumbs
         } else {
@@ -338,6 +372,13 @@ fn asset_menu(
                 let _ = workspace.update(cx, |this, cx| this.confirm_trash(&targets, window, cx));
             }),
     )
+}
+
+/// The filled star on starred cards, list rows and the inspector button.
+pub(super) fn favorite_icon(theme: &gpui_kit::component::Theme) -> Icon {
+    Icon::new(Lucide::StarFill)
+        .xsmall()
+        .text_color(theme.warning)
 }
 
 fn card(
@@ -384,16 +425,19 @@ fn card(
                         .text_color(theme.muted_foreground)
                         .child(asset.format.label()),
                 )
-                .when_some(status_badge(asset, &theme), |el, badge| {
+                .when(asset.favorite || asset.status.is_some(), |el| {
                     el.child(
-                        div()
+                        h_flex()
                             .absolute()
                             .top_1()
                             .right_1()
                             .p_0p5()
+                            .gap_0p5()
+                            .items_center()
                             .rounded_full()
                             .bg(theme.background.opacity(0.85))
-                            .child(badge),
+                            .when(asset.favorite, |el| el.child(favorite_icon(&theme)))
+                            .children(status_badge(asset, &theme)),
                     )
                 }),
         )
@@ -632,7 +676,10 @@ fn list_row(
                                 .truncate()
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(asset.name().to_string()),
-                        ),
+                        )
+                        .when(asset.favorite, |el| {
+                            el.child(favorite_icon(&theme).flex_shrink_0())
+                        }),
                 )
                 .when(!folder.is_empty(), |el| {
                     el.child(

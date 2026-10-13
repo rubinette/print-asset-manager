@@ -153,6 +153,9 @@ pub enum Key {
     Delete,
     RemoveSavedSearchDetail,
     NearbyFiles,
+    Favorites,
+    AddToFavorites,
+    RemoveFromFavorites,
 }
 
 static PREF: RwLock<LanguagePref> = RwLock::new(LanguagePref::System);
@@ -582,6 +585,12 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::RemoveSavedSearchDetail) => "Only the saved search is deleted; no files are touched.",
         (Language::Chinese, Key::NearbyFiles) => "同資料夾的圖片與說明",
         (Language::English, Key::NearbyFiles) => "Images and docs nearby",
+        (Language::Chinese, Key::Favorites) => "我的最愛",
+        (Language::English, Key::Favorites) => "Favorites",
+        (Language::Chinese, Key::AddToFavorites) => "加入我的最愛",
+        (Language::English, Key::AddToFavorites) => "Add to Favorites",
+        (Language::Chinese, Key::RemoveFromFavorites) => "從我的最愛移除",
+        (Language::English, Key::RemoveFromFavorites) => "Remove from Favorites",
     }
 }
 
@@ -784,6 +793,9 @@ mod tests {
             Key::Delete,
             Key::RemoveSavedSearchDetail,
             Key::NearbyFiles,
+            Key::Favorites,
+            Key::AddToFavorites,
+            Key::RemoveFromFavorites,
         ];
         for key in KEYS {
             assert!(
