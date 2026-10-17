@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=列印素材庫
+Name[en]=Print Asset Library
+Comment=管理 3MF / STL / OBJ 列印素材
+Comment[en]=Browse, tag and preview 3MF / STL / OBJ print files
+Exec=print-asset-manager
+Icon=print-asset-manager
+Terminal=false
+Categories=Graphics;3DGraphics;Utility;
+StartupWMClass=print-asset-manager

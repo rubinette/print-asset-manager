@@ -81,6 +81,8 @@ fn main() {
                 origin: point(px(80.), px(60.)),
                 size: size(px(1320.), px(860.)),
             }));
+            // Matches the Linux desktop entry, so the window gets its icon.
+            options.app_id = Some("print-asset-manager".into());
             if let Some(titlebar) = options.titlebar.as_mut() {
                 titlebar.title = Some(i18n::t(Key::AppTitle).into());
             }
