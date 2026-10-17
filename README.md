@@ -55,6 +55,21 @@ cargo run -p pam-app --release
 - **移除資料夾**：在側欄資料夾上按右鍵 →「移除資料夾…」。只從素材庫移除，不會動到磁碟上的檔案；之後再加回來，標籤、列印狀態和備註也會接回去。
 - **移除檔案**：在素材上按右鍵 →「移到垃圾桶…」，或用詳細資訊面板的垃圾桶按鈕。原始檔會移到系統垃圾桶（可復原），這是 App 唯一會動到原始檔的操作。
 
+## 發布
+
+先把 `Cargo.toml` 的 `version` 改成新版本並合併，再推一個對應的 tag：
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+GitHub Actions 的 Release 工作會編出下列檔案，放進一個**草稿** Release，確認後在 GitHub 上按發布：
+
+- `print-asset-manager-<版本>-macos-universal.dmg`：Intel 與 Apple Silicon 通用。尚未簽章與公證，第一次打開要在 Finder 對 App 按右鍵 →「打開」。
+- `print-asset-manager-<版本>-linux-x86_64.tar.gz`、`…-linux-aarch64.tar.gz`：解開後執行 `./install.sh` 安裝到 `~/.local`（含選單捷徑和圖示）。
+
+打包用的檔案在 `packaging/`；`packaging/icon.png` 是暫用圖示。
+
 ## 架構
 
 ```
