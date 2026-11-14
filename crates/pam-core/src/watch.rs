@@ -129,10 +129,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = WatchHandle::start().unwrap();
         handle.watch(dir.path().to_path_buf());
-        thread::sleep(Duration::from_millis(80));
-        fs::write(dir.path().join("fresh.stl"), b"solid x\nendsolid x\n").unwrap();
         let mut found = false;
         for _ in 0..25 {
+            // Written every round: the watch starts on another thread, and a
+            // write that lands before the OS stream is running is not reported.
+            fs::write(dir.path().join("fresh.stl"), b"solid x\nendsolid x\n").unwrap();
             let events = handle.drain(Duration::from_millis(80));
             if events.iter().any(|p| {
                 p.file_name()
