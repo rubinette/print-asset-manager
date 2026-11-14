@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- App icon source. Render with: rsvg-convert -w 1024 -h 1024 icon.svg -o icon.png -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#323a4c"/>
+      <stop offset="1" stop-color="#161a23"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff8a4f"/>
+      <stop offset="1" stop-color="#e5482a"/>
+    </linearGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fbf7ef"/>
+      <stop offset="1" stop-color="#e9e2d4"/>
+    </linearGradient>
+    <linearGradient id="right" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#c9c0af"/>
+      <stop offset="1" stop-color="#aea491"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d4659"/>
+      <stop offset="1" stop-color="#2a3040"/>
+    </linearGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+    <filter id="drop" x="-10%" y="-10%" width="120%" height="130%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="12"/>
+      <feOffset dy="10"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="plateClip"><polygon points="158.39999999999998,650.0 512.0,854.0 865.6,650.0 512.0,446.0"/></clipPath>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)" filter="url(#drop)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="3"/>
+
+  <g transform="translate(0,-18)">
+    <!-- build plate -->
+    <polygon points="158.39999999999998,650.0 512.0,854.0 865.6,650.0 512.0,446.0" fill="url(#plate)" stroke="#55607a" stroke-width="4" stroke-linejoin="round"/>
+    <g stroke="#55607a" stroke-opacity="0.55" stroke-width="2.5" fill="none">
+      <path d="M217.3,684.0 L570.9,480.0 M217.3,616.0 L570.9,820.0"/>
+      <path d="M276.3,718.0 L629.9,514.0 M276.3,582.0 L629.9,786.0"/>
+      <path d="M335.2,752.0 L688.8,548.0 M335.2,548.0 L688.8,752.0"/>
+      <path d="M394.1,786.0 L747.7,582.0 M394.1,514.0 L747.7,718.0"/>
+      <path d="M453.1,820.0 L806.7,616.0 M453.1,480.0 L806.7,684.0"/>
+    </g>
+    <g clip-path="url(#plateClip)">
+      <polygon points="252,650 512,800 772,650 842,700 572,870" fill="#0b0d12" fill-opacity="0.55" filter="url(#soft)"/>
+    </g>
+
+    <!-- printed block -->
+    <polygon points="252,380 512,530 512,800 252,650" fill="url(#left)"/>
+    <polygon points="512,530 772,380 772,650 512,800" fill="url(#right)"/>
+    <g fill="none" stroke="#3a3226" stroke-opacity="0.26" stroke-width="7" stroke-linejoin="round">
+      <path d="M252,425.0 L512,575.0 L772,425.0"/>
+      <path d="M252,470.0 L512,620.0 L772,470.0"/>
+      <path d="M252,515.0 L512,665.0 L772,515.0"/>
+      <path d="M252,560.0 L512,710.0 L772,560.0"/>
+      <path d="M252,605.0 L512,755.0 L772,605.0"/>
+    </g>
+    <g fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="3" stroke-linejoin="round" transform="translate(0,5)">
+      <path d="M252,425.0 L512,575.0 L772,425.0"/>
+      <path d="M252,470.0 L512,620.0 L772,470.0"/>
+      <path d="M252,515.0 L512,665.0 L772,515.0"/>
+      <path d="M252,560.0 L512,710.0 L772,560.0"/>
+      <path d="M252,605.0 L512,755.0 L772,605.0"/>
+    </g>
+    <polygon points="512,230 772,380 512,530 252,380" fill="url(#top)"/>
+    <path d="M252,380 L512,530 L772,380" fill="none" stroke="#ffd2b8" stroke-opacity="0.75" stroke-width="5" stroke-linejoin="round"/>
+  </g>
+</svg>

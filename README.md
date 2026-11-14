@@ -68,7 +68,7 @@ GitHub Actions 的 Release 工作會編出下列檔案，放進一個**草稿** 
 - `print-asset-manager-<版本>-macos-universal.dmg`：Intel 與 Apple Silicon 通用。尚未簽章與公證，第一次打開要在 Finder 對 App 按右鍵 →「打開」。
 - `print-asset-manager-<版本>-linux-x86_64.tar.gz`、`…-linux-aarch64.tar.gz`：解開後執行 `./install.sh` 安裝到 `~/.local`（含選單捷徑和圖示）。
 
-打包用的檔案在 `packaging/`；`packaging/icon.png` 是暫用圖示。
+打包用的檔案在 `packaging/`。圖示的原始檔是 `packaging/icon.svg`，改完後用 `rsvg-convert -w 1024 -h 1024 packaging/icon.svg -o packaging/icon.png` 重新產生 PNG。
 
 ## 架構
 
