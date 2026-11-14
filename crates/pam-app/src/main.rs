@@ -1,5 +1,6 @@
 mod i18n;
 mod jobs;
+mod startup_error;
 mod workspace;
 
 use gpui_kit::component::{Root, TitleBar};
@@ -75,6 +76,17 @@ fn main() {
 
         install_menus(cx);
 
+        // Opened before any window so a catalog this version can't read gets
+        // an explanation instead of a crash with no window.
+        let db_path = pam_core::paths::catalog_db_path();
+        let catalog = match pam_core::catalog::Catalog::open(&db_path) {
+            Ok(catalog) => std::sync::Arc::new(catalog),
+            Err(error) => {
+                startup_error::open_window(error, db_path, cx);
+                return;
+            }
+        };
+
         cx.spawn(async move |cx| {
             let mut options = TitleBar::window_options();
             options.window_bounds = Some(WindowBounds::Windowed(Bounds {
@@ -90,7 +102,7 @@ fn main() {
             cx.open_window(options, |window, cx| {
                 apply_system_theme(Some(window), cx);
                 window.set_window_title(i18n::t(Key::AppTitle));
-                let view = cx.new(|cx| Workspace::new(window, cx));
+                let view = cx.new(|cx| Workspace::new(catalog, window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("open window");

@@ -17,6 +17,11 @@ pub enum Error {
     EmptyMesh(PathBuf),
     #[error("parse error in {path}: {message}")]
     Parse { path: PathBuf, message: String },
+    #[error(
+        "the catalog was written by a newer version of the app \
+         (schema {found}, this version reads up to {supported}); update the app to open it"
+    )]
+    CatalogTooNew { found: i64, supported: i64 },
     #[error("{0}")]
     Message(String),
 }

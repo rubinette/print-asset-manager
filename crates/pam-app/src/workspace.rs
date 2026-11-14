@@ -147,9 +147,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let catalog =
-            Arc::new(Catalog::open(&pam_core::paths::catalog_db_path()).expect("open catalog"));
+    pub fn new(catalog: Arc<Catalog>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Redraw app-rendered thumbnails once after the renderer changed; the
         // startup scan below then kicks the thumbnail queue.
         if read_pref("thumb_version").as_deref().map(str::trim) != Some(jobs::THUMB_RENDER_VERSION)

@@ -65,6 +65,9 @@ pub enum Key {
     LanguageChinese,
     LanguageEnglish,
     Quit,
+    CatalogOpenFailed,
+    CatalogTooNewBody,
+    CatalogOpenFailedBody,
     Sort,
     SortNameAsc,
     SortNameDesc,
@@ -397,6 +400,20 @@ fn lookup(language: Language, key: Key) -> &'static str {
         (Language::English, Key::LanguageEnglish) => "English",
         (Language::Chinese, Key::Quit) => "結束",
         (Language::English, Key::Quit) => "Quit",
+        (Language::Chinese, Key::CatalogOpenFailed) => "無法打開素材庫",
+        (Language::English, Key::CatalogOpenFailed) => "Can’t open the library",
+        (Language::Chinese, Key::CatalogTooNewBody) => {
+            "這個素材庫是用較新版本的 App 建立的，目前的版本讀不了。請更新 App 後再打開；你的資料沒有被更動。"
+        }
+        (Language::English, Key::CatalogTooNewBody) => {
+            "This library was saved by a newer version of the app, which this version can’t read. Update the app to open it. Your data has not been changed."
+        }
+        (Language::Chinese, Key::CatalogOpenFailedBody) => {
+            "讀取索引檔時發生錯誤。你的模型檔案不受影響。"
+        }
+        (Language::English, Key::CatalogOpenFailedBody) => {
+            "The index file could not be read. Your model files are not affected."
+        }
         (Language::Chinese, Key::Sort) => "排序",
         (Language::English, Key::Sort) => "Sort",
         (Language::Chinese, Key::SortNameAsc) => "名稱 A → Z",
@@ -705,6 +722,9 @@ mod tests {
             Key::LanguageChinese,
             Key::LanguageEnglish,
             Key::Quit,
+            Key::CatalogOpenFailed,
+            Key::CatalogTooNewBody,
+            Key::CatalogOpenFailedBody,
             Key::Sort,
             Key::SortNameAsc,
             Key::SortNameDesc,

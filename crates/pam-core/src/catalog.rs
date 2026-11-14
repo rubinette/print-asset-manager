@@ -132,10 +132,10 @@ fn migrate(conn: &mut Connection, db_path: Option<&Path>, migrations: &[&str]) -
     let latest = 1 + migrations.len() as i64;
     let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if found > latest {
-        return Err(Error::Message(format!(
-            "the catalog was written by a newer version of the app \
-             (schema {found}, this version reads up to {latest}); update the app to open it"
-        )));
+        return Err(Error::CatalogTooNew {
+            found,
+            supported: latest,
+        });
     }
     if found == latest {
         return Ok(found);
