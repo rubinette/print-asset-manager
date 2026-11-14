@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension};
 use walkdir::WalkDir;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::hash::file_sha256;
 use crate::mesh::{AssetFormat, BBox};
 use crate::print_info::{PrintInfo, PRINT_INFO_VERSION};
@@ -18,11 +18,18 @@ const MOVE_HASH_CANDIDATES: usize = 8;
 /// Days a vanished file's tags wait in `detached_meta` for it to reappear.
 const DETACHED_KEEP_DAYS: i64 = 90;
 
-const SCHEMA: &str = r#"
+/// Run on every open; `foreign_keys` is per connection.
+const PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+";
 
+/// Schema version 1, frozen: every later change is an entry in `MIGRATIONS`,
+/// so a new catalog and an old one reach the current schema the same way.
+/// `IF NOT EXISTS` is for catalogs made before versions were recorded, which
+/// have some or all of these tables and `user_version` 0.
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS libraries (
   id INTEGER PRIMARY KEY,
   root_path TEXT NOT NULL UNIQUE,
@@ -56,15 +63,11 @@ CREATE TABLE IF NOT EXISTS asset_tags (
   PRIMARY KEY (asset_id, tag_id)
 );
 
--- Its own table rather than an assets column: there are no migrations, and
--- CREATE TABLE IF NOT EXISTS reaches catalogs made before favorites existed.
 CREATE TABLE IF NOT EXISTS favorites (
   asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE
 );
 
--- Print status and note per asset. Its own table rather than assets columns:
--- there are no migrations, and CREATE TABLE IF NOT EXISTS reaches catalogs
--- made before it existed. A row is dropped once both are cleared.
+-- Print status and note per asset. A row is dropped once both are cleared.
 CREATE TABLE IF NOT EXISTS asset_notes (
   asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
   status TEXT,
@@ -114,6 +117,56 @@ CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
   name, rel_path, tags, content='', contentless_delete=1
 );
 "#;
+
+/// `MIGRATIONS[i]` takes a catalog from schema version `i + 1` to `i + 2`.
+/// Append only: a released entry is never edited or removed. Each runs in a
+/// transaction with its version bump. Code that inserts or deletes assets must
+/// still keep `assets_fts` in sync; a migration that changes what is indexed
+/// has to rebuild those rows itself.
+const MIGRATIONS: &[&str] = &[];
+
+/// Brings `conn` to schema version `1 + migrations.len()` and returns the
+/// version it started at. Before changing a catalog that already has a
+/// version, a copy is written next to `db_path` as `<name>.v<version>.bak`.
+fn migrate(conn: &mut Connection, db_path: Option<&Path>, migrations: &[&str]) -> Result<i64> {
+    let latest = 1 + migrations.len() as i64;
+    let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if found > latest {
+        return Err(Error::Message(format!(
+            "the catalog was written by a newer version of the app \
+             (schema {found}, this version reads up to {latest}); update the app to open it"
+        )));
+    }
+    if found == latest {
+        return Ok(found);
+    }
+    if let (Some(path), true) = (db_path, found >= 1) {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".v{found}.bak"));
+        let backup = path.with_file_name(name);
+        match std::fs::remove_file(&backup) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        conn.execute("VACUUM INTO ?1", params![backup.to_string_lossy()])?;
+    }
+    let mut version = found;
+    if version == 0 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        version = 1;
+    }
+    for sql in &migrations[(version - 1) as usize..] {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        version += 1;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(found)
+}
 
 #[derive(Clone, Debug)]
 pub struct Library {
@@ -424,15 +477,16 @@ impl Catalog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Self::init(Connection::open(path)?)
+        Self::init(Connection::open(path)?, Some(path))
     }
 
     pub fn open_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch(SCHEMA)?;
+    fn init(mut conn: Connection, db_path: Option<&Path>) -> Result<Self> {
+        conn.execute_batch(PRAGMAS)?;
+        migrate(&mut conn, db_path, MIGRATIONS)?;
         conn.execute(
             "DELETE FROM detached_meta WHERE detached_at < ?1",
             params![now_secs() - DETACHED_KEEP_DAYS * 86_400],
@@ -1837,6 +1891,102 @@ mod tests {
         cat.remove_library(lib.id).unwrap();
         assert!(cat.libraries().unwrap().is_empty());
         assert!(cat.assets(&AssetQuery::default()).unwrap().is_empty());
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn new_catalog_is_stamped_with_the_current_version() {
+        let cat = Catalog::open_memory().unwrap();
+        let conn = cat.conn.lock().unwrap();
+        assert_eq!(user_version(&conn), 1 + MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn catalog_from_before_versions_keeps_its_data_and_gains_missing_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+                 INSERT INTO tags (name) VALUES ('petg');",
+            )
+            .unwrap();
+        }
+        let cat = Catalog::open(&db).unwrap();
+        let conn = cat.conn.lock().unwrap();
+        assert_eq!(user_version(&conn), 1 + MIGRATIONS.len() as i64);
+        let name: String = conn
+            .query_row("SELECT name FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "petg");
+        let favorites: i64 = conn
+            .query_row("SELECT COUNT(*) FROM favorites", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(favorites, 0);
+        assert!(!dir.path().join("catalog.sqlite.v0.bak").exists());
+    }
+
+    #[test]
+    fn migrations_run_once_in_order_and_back_up_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.sqlite");
+        let steps = [
+            "ALTER TABLE tags ADD COLUMN color TEXT;",
+            "UPDATE tags SET color = 'red';",
+        ];
+        let mut conn = Connection::open(&db).unwrap();
+        assert_eq!(migrate(&mut conn, Some(&db), &[]).unwrap(), 0);
+        conn.execute("INSERT INTO tags (name) VALUES ('petg')", [])
+            .unwrap();
+
+        assert_eq!(migrate(&mut conn, Some(&db), &steps[..1]).unwrap(), 1);
+        assert_eq!(user_version(&conn), 2);
+        assert_eq!(migrate(&mut conn, Some(&db), &steps).unwrap(), 2);
+        assert_eq!(migrate(&mut conn, Some(&db), &steps).unwrap(), 3);
+        let color: String = conn
+            .query_row("SELECT color FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(color, "red");
+
+        // The v1 backup is the catalog as it was before the first step.
+        let backup = Connection::open(dir.path().join("catalog.sqlite.v1.bak")).unwrap();
+        assert_eq!(user_version(&backup), 1);
+        assert!(backup.prepare("SELECT color FROM tags").is_err());
+        let name: String = backup
+            .query_row("SELECT name FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "petg");
+    }
+
+    #[test]
+    fn failed_migration_changes_nothing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn, None, &[]).unwrap();
+        let steps = ["ALTER TABLE tags ADD COLUMN color TEXT; SELECT * FROM no_such_table;"];
+        assert!(migrate(&mut conn, None, &steps).is_err());
+        assert_eq!(user_version(&conn), 1);
+        assert!(conn.prepare("SELECT color FROM tags").is_err());
+    }
+
+    #[test]
+    fn catalog_from_a_newer_version_is_refused_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.sqlite");
+        drop(Catalog::open(&db).unwrap());
+        let newer = 2 + MIGRATIONS.len() as i64;
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", newer).unwrap();
+        }
+        let err = Catalog::open(&db).err().unwrap().to_string();
+        assert!(err.contains("newer version"), "{err}");
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(user_version(&conn), newer);
     }
 
     fn fts_rows(cat: &Catalog) -> i64 {
